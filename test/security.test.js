@@ -7,10 +7,10 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { createTimedFetch } = require('../core/util.js');
 
 const ROOT = path.join(__dirname, '..');
 const DIST = path.join(ROOT, 'dist/emias-slot-hunter.user.js');
-const RELEASE_URL = 'https://raw.githubusercontent.com/polinalamponi/emias-slot-hunter/release/dist/emias-slot-hunter.user.js';
 
 function split() {
   const src = fs.readFileSync(DIST, 'utf8');
@@ -38,10 +38,10 @@ test('шапка: никаких разрешений Tampermonkey и внешн
   }
 });
 
-test('шапка: обновления приходят только из ветки release', () => {
+test('шапка: скрипт обновляется только вручную', () => {
   const { meta } = split();
-  assert.deepEqual(values(meta, 'updateURL'), [RELEASE_URL]);
-  assert.deepEqual(values(meta, 'downloadURL'), [RELEASE_URL]);
+  assert.deepEqual(values(meta, 'updateURL'), []);
+  assert.deepEqual(values(meta, 'downloadURL'), ['none']);
 });
 
 test('код: в нём нет адресов, кроме emias.info', () => {
@@ -52,12 +52,25 @@ test('код: в нём нет адресов, кроме emias.info', () => {
 
 test('код: fetch только по относительным путям ЕМИАС', () => {
   const { body } = split();
-  const calls = [...body.matchAll(/\bfetch\s*\(\s*(.)/g)];
+  // Обёртка с таймаутом проверяет относительный путь, origin и отключает редиректы.
+  const wrapped = "fetch(url, { ...opts, mode: 'same-origin', redirect: 'error', signal: controller.signal })";
+  assert.equal(body.split(wrapped).length, 2);
+  const direct = body.replace(wrapped, '');
+  const calls = [...direct.matchAll(/\bfetch\s*\(\s*(.)/g)];
   assert.ok(calls.length > 0);
   for (const c of calls) {
-    const rest = body.slice(c.index + c[0].length - 1, c.index + c[0].length + 1);
-    assert.ok(/^['"`]\//.test(rest), `fetch должен начинаться с пути '/…' на том же сайте: ${body.slice(c.index, c.index + 60)}`);
+    const rest = direct.slice(c.index + c[0].length - 1, c.index + c[0].length + 1);
+    assert.ok(/^['"`]\//.test(rest), `fetch должен начинаться с пути '/…' на том же сайте: ${direct.slice(c.index, c.index + 60)}`);
   }
+});
+
+test('обёртка fetch отбрасывает сторонние URL и переходы между путями', async () => {
+  let calls = 0;
+  const fetch = createTimedFetch(async () => { calls++; });
+  for (const url of ['https://example.invalid/api-eip/slots', '//example.invalid/api-eip/slots', '/api-eip/../other']) {
+    await assert.rejects(fetch(url, {}), /разрешённых путей/);
+  }
+  assert.equal(calls, 0);
 });
 
 test('код: нет других способов отправить данные или выполнить чужой код', () => {

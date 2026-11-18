@@ -3,6 +3,36 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createApi, SessionError } = require('../core/api.js');
 const { createErrors } = require('../core/errors.js');
+const { createTimedFetch } = require('../core/util.js');
+
+test('таймаут распространяется на чтение тела', async () => {
+  let signal;
+  const fetch = createTimedFetch(async (url, options) => {
+    signal = options.signal;
+    assert.equal(options.mode, 'same-origin');
+    assert.equal(options.redirect, 'error');
+    return { ok: true, status: 200, text: () => new Promise(() => {}) };
+  }, 10);
+  await assert.rejects(fetch('/api-eip/test'), /время ожидания/i);
+  assert.equal(signal.aborted, true);
+});
+
+test('остановка во время продления блокирует повтор запроса записи', async () => {
+  let resolve;
+  const refresh = new Promise((done) => { resolve = done; });
+  let active = true;
+  let calls = 0;
+  const api = createApi({
+    session: { ...fakeSession(), refresh: () => refresh }, errors, now: () => 0,
+    fetch: async () => { calls++; return { ok: false, status: 401, text: async () => '' }; },
+  });
+  const result = api.post('createAppointment', {}, () => active);
+  await new Promise(setImmediate);
+  active = false;
+  resolve(true);
+  assert.equal((await result).aborted, true);
+  assert.equal(calls, 1);
+});
 
 const errors = createErrors();
 

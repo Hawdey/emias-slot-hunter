@@ -32,6 +32,18 @@ test('исследование и приём врача становятся ц�
   assert.match(doc.title, /эндокринолог/i);
 });
 
+test('для текущей записи передаёт имя и идентификатор врача, если ЕМИАС их вернул', async () => {
+  const appointment = structuredClone(appointments.payload.appointment[2]);
+  appointment.toDoctor.doctorFio = 'Петров П.П.';
+  appointment.availableResourceId = 200000005;
+  const mock = { post: async (p) => p.includes('Referrals') ? { ok: true, json: referrals }
+    : { ok: true, json: { payload: { appointment: [appointment] } } } };
+  const list = await createDiscover({ api: mock }).list();
+  const doc = list.find((o) => o.scenario === 'shiftDoctor');
+  assert.equal(doc.source.availableResourceId, 200000005);
+  assert.equal(doc.source.doctorName, 'Петров П.П.');
+});
+
 test('направление на исследование (toLdp) без записи становится целью bookLdp', async () => {
   const list = await createDiscover({ api }).list();
   const ref = list.find((o) => o.id === 'ref:900000000004');

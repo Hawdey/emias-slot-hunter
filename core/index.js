@@ -113,8 +113,9 @@
     const util = M.createUtil();
     const errors = M.createErrors();
     const filters = M.createFilters(util);
-    const session = M.createSession({ storage, fetch, now });
-    const api = M.createApi({ session, errors, fetch, now });
+    const timedFetch = M.createTimedFetch(fetch, config.requestTimeoutMs);
+    const session = M.createSession({ storage, fetch: timedFetch, now });
+    const api = M.createApi({ session, errors, fetch: timedFetch, now });
     const discover = M.createDiscover({ api, today: () => util.mskDate(new Date(now())) });
     const targets = M.createTargets({ api, filters, util });
 
@@ -127,7 +128,7 @@
       for (const fn of listeners['*'] || []) fn({ type, payload });
     };
 
-    const safeConfig = { slowMs: 30000, minIntervalMs: 30000, refreshAt: 0.6, sleepFactor: 3, staleFactor: 3, ...config };
+    const safeConfig = { slowMs: MIN_INTERVAL_MS, minIntervalMs: MIN_INTERVAL_MS, sleepFactor: 3, staleFactor: 3, ...config };
     // Жёсткий пол применяем уже ПОСЛЕ разворачивания пользовательского config —
     // runner.js берёт Math.max(minIntervalMs, slowMs), поэтому если оба поля
     // занижены одновременно, пол внутри runner.js не спасёт.
@@ -167,9 +168,7 @@
     // сообщению ни на что, кроме отметки времени у чужих вкладок, влиять не
     // положено (обработчик claim ниже не меняется). leaderSeenAtTs — время
     // последнего чужого alive ИЛИ claim; без channel координации нет вовсе,
-    // и leaderSeenAt() всегда отдаёт 0. Используется в userscript/ui-dom.js:
-    // standby-вкладка запускает дорогой startFromSavedConfig() только если
-    // давно ничего не слышала от лидера, а не раз в минуту вслепую.
+    // и leaderSeenAt() всегда отдаёт 0.
     let leaderSeenAtTs = 0;
     function sendAlive() {
       // Раннер мог остановиться сам (например, needDryRun на тике) в обход
@@ -201,77 +200,44 @@
       };
     }
 
-    // Настоящий idToken ЕМИАС даты рождения не содержит (проверено на живой
-    // вкладке 2026-09-24: поля jti, exp, ua_ver, trusted, iat, sub, aud, amr,
-    // sid, iss, ua_id, FirstName — birthdate/birth_date среди них нет).
-    // Полис при этом в хранилище есть (persist:persist.persistOmsNumber).
-    // Сам сайт берёт дату рождения из ответа GET /api-eip/v2/policy/list —
-    // если её не нашлось в idToken, спрашиваем тот же список и берём дату из
-    // полиса, чей omsNumber совпал с persistOmsNumber (в ответе может быть
-    // несколько полисов, например старый и текущий). Дату рождения нигде не
-    // сохраняем — она живёт только в session.identity() (в памяти), как и
-    // раньше для явно введённой.
+    // Дата относится к владельцу выбранного полиса. В одном входе могут
+    // быть полисы разных пациентов.
     async function birthFromPolicyList(oms) {
       if (!oms) return null; // сверять не с чем — не обращаемся вообще
       const r = await api.get('v2/policy/list');
       if (!r.ok || !r.json) return null;
-      const policies = (r.json.payload && r.json.payload.policies) || [];
-      const mine = policies.find((p) => p && p.omsNumber === oms);
+      const policies = r.json.payload?.policies;
+      if (!Array.isArray(policies)) return null;
+      const mine = policies.find((p) => p?.omsNumber != null && String(p.omsNumber) === String(oms));
       return (mine && String(mine.birthDate || '').slice(0, 10)) || null;
     }
 
-    // Полис и дату рождения предпочтительно передают явно (opts.identity) —
-    // например, их вводит пользователь в интерфейсе. Если их нет, пробуем
-    // угадать из хранилища сайта, а если даты там нет — из policy/list; любая
-    // ошибка разбора здесь не должна валить init() — просто вернём null и
-    // вызывающий код попросит ввести их. Ошибка сессии (SessionError из
-    // api.get) наоборот НЕ гасится — это не «не нашли данные», а настоящая
-    // потеря входа, и она должна дойти до вызывающего кода как есть.
-    async function identityFromStorage() {
-      let oms = null;
-      try { oms = JSON.parse(JSON.parse(storage.getItem('persist:persist')).persistOmsNumber); } catch (e) { oms = null; }
-      let birth = null;
-      try {
-        const t = JSON.parse(JSON.parse(storage.getItem('persist:sessionAuth')).idToken);
-        const payload = JSON.parse(decodeURIComponent(escape(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')))));
-        birth = (payload.birthdate || payload.birth_date || '').slice(0, 10) || null;
-      } catch (e) { birth = null; }
-      if (!birth) birth = await birthFromPolicyList(oms);
-      return { oms, birth };
-    }
-
-    // Залогинен ли сам сайт. После выхода ЕМИАС стирает токены и полис, но
-    // наша копия токенов (emiasSlotHunter:auth) остаётся и session.read() её
-    // принимает — без этой проверки человек видел бы «не нашла полис» вместо
-    // «войдите».
-    function siteLoggedIn() {
-      try { return !!JSON.parse(JSON.parse(storage.getItem('persist:sessionAuth')).accessToken); } catch (e) { return false; }
-    }
-
     async function init(opts = {}) {
-      // Бросает понятную ошибку, если входа в ЕМИАС нет вовсе — не глотаем.
-      session.read();
-      if (!opts.identity && !siteLoggedIn()) throw new Error('нет входа в ЕМИАС: войдите на сайте и попробуйте снова');
-      const id = opts.identity || await identityFromStorage();
-      if (!id.oms || !id.birth) {
+      const scope = session.read();
+      const id = opts.identity || { oms: scope.policy, birth: await birthFromPolicyList(scope.policy) };
+      if (!id.oms || !/^\d{4}-\d{2}-\d{2}$/.test(id.birth)) {
         throw new IdentityError('не удалось определить полис и дату рождения — откройте раздел «Записи» на сайте и попробуйте снова');
       }
-      session.setIdentity(id);
+      session.setIdentity(id, scope);
       return { ok: true };
     }
 
-    // Список целей нормализуем перед передачей раннеру: keepImproving по
-    // умолчанию включён (искать более удобный слот и после первой удачной
-    // записи/переноса), кроме bookReferral — этот сценарий в v0.1 не
-    // поддержан целиком (см. targets.js), «улучшать» там нечего. Явное
-    // keepImproving: false в цели отключает поведение.
     function normalizeTarget(t) {
-      return { ...t, keepImproving: t.keepImproving !== false && t.scenario !== 'bookReferral' };
+      return { ...t, keepImproving: t.keepImproving === true && !t.anyTime && t.scenario !== 'bookReferral' };
     }
 
     return {
       init,
+      checkSession: () => session.assertContext(),
+      clearSession: (finishInFlight = false) => {
+        runner.stop();
+        stopAlive();
+        const pending = finishInFlight ? runner.inFlightBooking() : null;
+        if (pending) session.clearAfter(pending);
+        else session.clear();
+      },
       discover: () => discover.list(),
+      listDoctors: (option) => targets.listDoctors(option),
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),
@@ -288,7 +254,7 @@
         return { ok: true };
       },
       stop: () => { stopAlive(); return runner.stop(); },
-      answer: (targetId, decision) => runner.answer(targetId, decision),
+      answer: (targetId, decision, offerId) => runner.answer(targetId, decision, offerId),
       status: () => runner.status(),
       leaderSeenAt: () => leaderSeenAtTs,
       on: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },

@@ -154,27 +154,6 @@ test('stop() во время первого чтения записей не з�
   assert.equal(h.scheduled.length, 0);
 });
 
-test('stop() во время обновления сессии не запускает чтение записей', async () => {
-  const response = deferred();
-  const entered = deferred();
-  let reads = 0;
-  const h = harness({
-    session: { needsRefresh: () => true, refresh: () => { entered.resolve(); return response.promise; }, refreshedAt: 0 },
-    apiPost: async () => { reads++; return { ok: true, json: { payload: { appointment: [] } } }; },
-  });
-  h.runner.setTargets([target]);
-  h.runner.confirmDryRun((await h.runner.dryRun()).id);
-  await h.runner.start();
-  reads = 0;
-  const tick = h.runner.tick();
-  await entered.promise;
-  h.runner.stop();
-  response.resolve(true);
-  await tick;
-  assert.equal(reads, 0);
-  assert.equal(h.scheduled.length, 0);
-});
-
 test('смена целей во время поиска не даёт записать слот из старого ответа', async () => {
   const response = deferred();
   const entered = deferred();
@@ -431,7 +410,7 @@ test('verifyFailed: цель не помечается выполненной и
   assert.equal(acted, 1, 'повторной попытки на том же слоте сразу быть не должно');
 });
 
-test('verifyFailed: по истечении 10 минут попытка на том же слоте снова разрешена', async () => {
+test('verifyFailed: после неопределённого результата повторной попытки нет даже через 10 минут', async () => {
   let acted = 0;
   const h = harness({
     search: async () => ({ candidates: [cand], rejected: [], notes: [] }),
@@ -448,8 +427,8 @@ test('verifyFailed: по истечении 10 минут попытка на т
   assert.equal(acted, 1);
   h.advance(10 * 60 * 1000 + 1);
   await h.runner.tick();
-  assert.equal(acted, 2, 'после истечения TTL метка снимается и попытка повторяется');
-  assert.equal(h.runner.status().targets[0].state, 'done');
+  assert.equal(acted, 1);
+  assert.equal(h.runner.status().targets[0].state, 'stopped');
 });
 
 test('act(): action stopTarget выключает цель', async () => {
@@ -583,6 +562,23 @@ test('answer() после stop() не отправляет ничего в ЕМ�
   const res = await h.runner.answer(target.id, 'book');
   assert.equal(res.ok, false);
   assert.equal(acted, 0, 'act() не должен вызываться после stop()');
+});
+
+test('answer проверяет срок и номер карточки непосредственно перед записью', async () => {
+  let acted = 0;
+  const h = harness({
+    search: async () => ({ candidates: [cand], rejected: [], notes: [] }),
+    act: async () => { acted++; return { ok: true, verified: true }; },
+  });
+  h.runner.setTargets([{ ...target, mode: 'confirm' }]);
+  h.runner.confirmDryRun((await h.runner.dryRun()).id);
+  await h.runner.start();
+  await h.runner.tick();
+  const { offerId } = h.events.find((event) => event.type === 'needConfirm').payload;
+  assert.equal((await h.runner.answer(target.id, 'book', offerId - 1)).aborted, true);
+  h.advance(60000);
+  assert.equal((await h.runner.answer(target.id, 'book', offerId)).aborted, true);
+  assert.equal(acted, 0);
 });
 
 test('setTargets сбрасывает и подтверждение, и последний отчёт холостого прогона', async () => {
@@ -822,7 +818,11 @@ test('запись на анализ по назначению узнаётся 
   const appts = { list: [{ id: 77, startTime: '2026-11-12T08:00:00', lpuId: 1, toBM: { id: 1, name: 'Кровь' } }] };
   const h = statusHarness(appts);
   h.runner.setTargets([{ ...target, keepImproving: true }]);
-  await h.runner.dryRun();
+  const report = await h.runner.dryRun();
+  assert.match(report.items[0].notes[0], /уже есть запись/);
+  h.runner.confirmDryRun(report.id);
+  await h.runner.start();
+  await h.runner.tick();
   assert.equal(h.seen[0].scenario, 'shiftLab');
   assert.equal(h.seen[0].appointmentId, 77);
 });

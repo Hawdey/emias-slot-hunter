@@ -26,7 +26,7 @@
       // Обрабатываем существующие записи как цели переноса
       for (const a of appts) {
         // IMPORTANT 2: проверяем наличие startTime перед конкатенацией
-        const current = a.startTime ? (a.startTime + '+03:00') : null;
+        const current = a.startTime && !/(?:Z|[+-]\d\d:?\d\d)$/.test(a.startTime) ? a.startTime + '+03:00' : a.startTime || null;
         const common = { current, address: a.lpuAddress || null, deadline: null, supported: !!a.enableShift,
           unsupportedReason: a.enableShift ? null : 'ЕМИАС не разрешает переносить эту запись' };
         // Вид записи определяем по содержимому, а не по a.type: на живом сайте
@@ -39,7 +39,11 @@
             source: { appointmentId: a.id, ldpTypeId: Number(a.toLdp.ldpTypeId), referralId: a.referral && a.referral.referralId, lpuId: a.lpuId } });
         } else if (a.toDoctor) {
           out.push({ id: 'appt:' + a.id, scenario: 'shiftDoctor', title: a.toDoctor.specialityName, ...common,
-            source: { appointmentId: a.id, specialityName: a.toDoctor.specialityName, referralId: a.referral && a.referral.referralId, lpuId: a.lpuId } });
+            source: {
+              appointmentId: a.id, specialityName: a.toDoctor.specialityName, referralId: a.referral?.referralId, lpuId: a.lpuId,
+              availableResourceId: a.toDoctor.availableResourceId ?? a.availableResourceId ?? null,
+              doctorName: a.toDoctor.doctorFio || null,
+            } });
         } else {
           // Непонятную запись не прячем: человек должен видеть, что скрипт её
           // заметил, но пока не умеет с ней работать.

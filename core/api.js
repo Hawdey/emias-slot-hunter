@@ -18,19 +18,19 @@
     // Общая часть post() и get(): заголовки, сетевой бэкофф, продление сессии
     // по 401, разбор ответа. body === undefined → запрос без тела (GET), с
     // телом → Content-Type и JSON.stringify (POST).
-    async function request(method, path, body, retried, canContinue) {
-      if (canContinue && !canContinue()) {
-        return { ok: false, cancelled: true, status: 0, json: null, explained: null };
+    async function request(method, path, body, retried, canSend) {
+      if (canSend && !canSend()) return { ok: false, aborted: true };
+      const headers = { Accept: 'application/json', 'EI-Token': session.token(), 'X-App': 'portal' };
+      const opts = { method, headers };
+      if (body !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
       }
       let r;
+      let text;
       try {
-        const headers = { Accept: 'application/json', 'EI-Token': session.token(), 'X-App': 'portal' };
-        const opts = { method, headers };
-        if (body !== undefined) {
-          headers['Content-Type'] = 'application/json';
-          opts.body = JSON.stringify(body);
-        }
         r = await fetch('/api-eip/' + path, opts);
+        text = await r.text();
       } catch (e) {
         // Увеличиваем паузу при сетевой ошибке: 30s → 60s → 120s → 300s
         netStep = Math.min(netStep + 1, NET_STEPS.length - 1);
@@ -40,16 +40,17 @@
       // Сброс счётчика сетевых ошибок при успешном соединении
       netStep = -1;
 
-      const text = await r.text();
       let json = null;
       try { json = JSON.parse(text); } catch (e) { json = null; }
 
       // 401: пытаемся один раз продлить сессию и повторить запрос
       if (r.status === 401 && !retried) {
-        if (canContinue && !canContinue()) {
-          return { ok: false, cancelled: true, status: r.status, json, explained: null };
-        }
-        if (await session.refresh()) return request(method, path, body, true, canContinue);
+        if (canSend && !canSend()) return { ok: false, aborted: true };
+        let refreshed = false;
+        try { refreshed = await session.refresh(); }
+        catch (e) { if (e?.name === 'SessionError') throw e; }
+        if (canSend && !canSend()) return { ok: false, aborted: true };
+        if (refreshed) return request(method, path, body, true, canSend);
       }
       // Повторный 401 — сессия не продлевается. Текст этого сообщения попадает
       // пользователю на глаза как есть (userscript/ui-dom.js onSessionLost
@@ -58,7 +59,7 @@
       // техническим языком — и той же формулировкой, что уже даёт errors.js
       // для 401 (см. explain()), чтобы текст не расходился в зависимости от
       // того, через какой путь сессия оказалась потеряна.
-      if (r.status === 401) throw new SessionError('Вход в ЕМИАС закончился. Войдите заново в другой вкладке — поиск продолжится сам.');
+      if (r.status === 401) throw new SessionError('Вход в ЕМИАС закончился. Войдите заново и настройте поиск.');
       // 429 и 5xx ошибки требуют паузу
       if (r.status === 429 || r.status >= 500) backoffUntil = now() + 30000;
 
@@ -79,9 +80,9 @@
       };
     }
 
-    function post(path, body, retried, canContinue) {
+    function post(path, body, canSend) {
       const id = session.identity();
-      return request('POST', path, { omsNumber: id.oms, birthDate: id.birth, ...body }, retried, canContinue);
+      return request('POST', path, { omsNumber: id.oms, birthDate: id.birth, ...body }, false, canSend);
     }
 
     // GET без тела и без omsNumber/birthDate — используется до того, как

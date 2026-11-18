@@ -21,7 +21,7 @@
     // т.к. ЕМИАС иногда помечает недоступность прямо на самом ресурсе, а не
     // только через обёртку notAvailableResources. Дедуплицируем по id — один
     // и тот же кабинет может встретиться в дереве несколько раз.
-    function collectResources(payload) {
+    function collectResources(payload, includeUnavailable = false) {
       const out = [];
       const seen = new Set();
       (function walk(node, notAvail) {
@@ -31,8 +31,9 @@
         for (const [k, v] of Object.entries(node)) {
           if (v && typeof v === 'object') walk(v, notAvail || selfNotAvail || /notAvailable/i.test(k));
         }
-        if (!notAvail && !selfNotAvail && node.id && Array.isArray(node.complexResource) && 'arType' in node && !seen.has(node.id)) {
-          seen.add(node.id);
+        if ((includeUnavailable || (!notAvail && !selfNotAvail))
+            && node.id && Array.isArray(node.complexResource) && 'arType' in node && !seen.has(String(node.id))) {
+          seen.add(String(node.id));
           out.push(node);
         }
       })(payload, false);
@@ -54,7 +55,7 @@
       const out = [];
       for (const day of (payload && payload.scheduleOfDay) || [])
         for (const sb of day.scheduleBySlot || [])
-          if (!sb.complexResourceId || sb.complexResourceId === crId)
+          if (!sb.complexResourceId || String(sb.complexResourceId) === String(crId))
             for (const sl of sb.slot || []) out.push(sl);
       return out.sort((a, b) => toMs(a.startTime) - toMs(b.startTime));
     }
@@ -63,6 +64,13 @@
     // существующих записей и требуют appointmentId в каждом запросе к ЕМИАС.
     const isShift = (t) => !['bookLab', 'bookDoctor', 'bookLdp'].includes(t.scenario);
     const isReferralBooking = (t) => t.scenario === 'bookDoctor' || t.scenario === 'bookLdp';
+    const isDoctor = (t) => t.scenario === 'shiftDoctor' || t.scenario === 'bookDoctor';
+    const sameResource = (a, b) => a != null && a !== '' && b != null && b !== '' && String(a) === String(b);
+    const sameDoctorShift = (t) => t.scenario === 'shiftDoctor' && t.sameDoctor === true;
+    const requiresDoctor = (t) => sameDoctorShift(t) || (t.scenario === 'bookDoctor' && !!t.source.availableResourceId);
+    const doctorMismatch = () => ({
+      ok: false, action: 'stopTarget', message: 'Не удалось подтвердить выбранного врача. Настройте поиск заново.',
+    });
 
     // Период поиска: не раньше сегодняшнего дня (и не раньше dateFrom цели).
     // Верхняя граница — в таком порядке: onlyDay; день текущей записи (для
@@ -99,6 +107,20 @@
       return api.post('v5/saOrchestrator/getDoctorsInfo', { appointmentId: t.source.appointmentId, purposeReceptionForm: 'personal' });
     }
 
+    async function listDoctors(option) {
+      if (option.scenario !== 'shiftDoctor') return [];
+      const res = await listResources(option);
+      if (!res.ok) throw new Error(res.explained?.message || 'Не удалось получить список врачей ЕМИАС.');
+      const doctors = collectResources(res.json?.payload, true)
+        .filter((r) => typeof r.name === 'string' && r.name.trim())
+        .map((r) => ({ id: r.id, name: r.name.trim() }));
+      const key = (name) => name.toLowerCase().replace(/[.\s]+/g, '');
+      const counts = new Map();
+      for (const { name } of doctors) counts.set(key(name), (counts.get(key(name)) || 0) + 1);
+      return doctors.map((doctor) => ({ ...doctor, ambiguous: counts.get(key(doctor.name)) > 1 }))
+        .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+    }
+
     async function search(t, ctx) {
       if (!SUPPORTED_SCENARIOS.has(t.scenario)) {
         return { candidates: [], rejected: [], notes: [UNSUPPORTED_MESSAGE], action: null };
@@ -108,6 +130,10 @@
       // не делаем вообще никаких запросов, а сразу объясняем, чего не хватает.
       if (t.scenario === 'bookDoctor' && t.source.needPurpose && !t.purpose) {
         return { candidates: [], rejected: [], notes: [NEED_PURPOSE_MESSAGE], action: null };
+      }
+      if (sameDoctorShift(t) && !t.source.availableResourceId) {
+        const failure = doctorMismatch();
+        return { candidates: [], rejected: [], notes: [failure.message], action: failure.action };
       }
       const p = period(t, ctx.now);
       const notes = [];
@@ -121,10 +147,11 @@
         };
       }
       let resources = collectResources(res.json && res.json.payload);
-      // Направление к конкретному врачу (availableResourceId уже известен из
-      // getAssignmentsReferralsInfo) — не предлагаем записаться к другому врачу.
-      if (t.scenario === 'bookDoctor' && t.source.availableResourceId) {
-        resources = resources.filter((r) => String(r.id) === String(t.source.availableResourceId));
+      if (requiresDoctor(t)) {
+        resources = resources.filter((r) => sameResource(r.id, t.source.availableResourceId));
+        if (!resources.length) {
+          return { candidates: [], rejected: [], notes: ['ЕМИАС не предлагает расписание выбранного врача.'], action: null };
+        }
       }
       if (!resources.length) return { candidates: [], rejected: [], notes: ['Свободных кабинетов или врачей сейчас нет'], action: null };
 
@@ -132,6 +159,7 @@
       let rejected = [];
       let addressMismatch = 0;
       let addressUnknown = 0;
+      let doctorUnknown = false;
       // C2: без этой проверки цикл продолжал бы слать getAvailableResourceScheduleInfo
       // по всем оставшимся кабинетам/врачам даже после того, как ЕМИАС уже ответил 429 —
       // от одной цели с десятками ресурсов в один тик могло уйти десятки запросов подряд.
@@ -141,6 +169,7 @@
       resourceLoop:
       for (const r of resources) {
         for (const cr of r.complexResource) {
+          if (ctx.active && !ctx.active()) break resourceLoop;
           if (ctx.now < api.backoffUntil()) { pausedByBackoff = true; break resourceLoop; }
           const body = { availableResourceId: r.id, complexResourceId: cr.id, period: p };
           if (isShift(t)) body.appointmentId = t.source.appointmentId;
@@ -156,10 +185,15 @@
             action = (s.explained && s.explained.action) || action;
             continue;
           }
-          const address = scheduleAddress(s.json.payload, cr.id);
+          const payload = s.json?.payload;
+          if (sameDoctorShift(t) && !sameResource(payload?.availableResource?.id, r.id)) {
+            doctorUnknown = true;
+            continue;
+          }
+          const address = scheduleAddress(payload, cr.id);
           if (!address) { addressUnknown++; continue; }
           if (t.addressContains && !address.toLowerCase().includes(String(t.addressContains).toLowerCase())) { addressMismatch++; continue; }
-          const slots = scheduleSlots(s.json.payload, cr.id);
+          const slots = scheduleSlots(payload, cr.id);
           const picked = filters.pickSlots({
             slots,
             target: { ...t, selfId: t.source.appointmentId || null },
@@ -169,13 +203,17 @@
           // строки в notes человек видел бы пустой список без объяснения причины.
           if (picked.skipped) notes.push(picked.skipped);
           rejected = rejected.concat(picked.rejected.map((x) => ({ ...x, address })));
-          for (const slot of picked.ok) candidates.push({ slot, address, resourceId: r.id, complexResourceId: cr.id, name: r.name });
+          for (const slot of picked.ok) candidates.push({
+            slot, address, resourceId: r.id, complexResourceId: cr.id, name: r.name,
+            doctorName: isDoctor(t) ? (r.name || t.source.doctorName || null) : null,
+          });
         }
       }
       const compare = filters.slotComparator(t);
       candidates.sort((a, b) => compare(a.slot, b.slot));
       if (addressUnknown) notes.push(`Не удалось определить адрес ${addressUnknown} кабинет(ов) в расписании — пропущены`);
       if (addressMismatch) notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`);
+      if (doctorUnknown) notes.push('ЕМИАС вернул расписание без подтверждения выбранного врача. Оно пропущено.');
       if (pausedByBackoff) notes.push('ЕМИАС попросил паузу — часть кабинетов не проверена, продолжу на следующей проверке');
       return { candidates, rejected, notes, action };
     }
@@ -195,28 +233,41 @@
       if (toMs(appt.startTime) !== toMs(cand.slot.startTime)) return false;
       if (campus(appt.lpuAddress) !== campus(cand.address)) return false;
       if (t.scenario === 'bookLab') {
-        if (beforeIds.has(appt.id)) return false;
+        if (beforeIds.has(String(appt.id))) return false;
         return !!appt.toBM && Number(appt.toBM.id) === Number(t.source.samplingTypeId);
       }
       if (t.scenario === 'bookDoctor') {
-        if (beforeIds.has(appt.id)) return false;
-        return !!appt.toDoctor;
+        if (beforeIds.has(String(appt.id))) return false;
+        return matchesDoctor(t, appt, cand);
       }
       if (t.scenario === 'bookLdp') {
-        if (beforeIds.has(appt.id)) return false;
-        return !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
+        if (beforeIds.has(String(appt.id))) return false;
+        return sameReferral(t, appt) && !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
       }
       // Перенос: ЕМИАС выдаёт перенесённой записи новый id (проверено на живом
       // сайте — и для крови, и для приёма врача). Поэтому своя запись — либо с
       // прежним id, либо новая, которой не было в списке до переноса. Запись,
       // которая уже была до переноса под другим id, — чужая.
-      if (appt.id !== t.source.appointmentId && beforeIds.has(appt.id)) return false;
-      if (t.scenario === 'shiftLdp') return !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
-      if (t.scenario === 'shiftDoctor') {
-        return !!appt.toDoctor && (!t.source.specialityName || appt.toDoctor.specialityName === t.source.specialityName);
-      }
+      if (String(appt.id) !== String(t.source.appointmentId) && beforeIds.has(String(appt.id))) return false;
+      if (t.scenario === 'shiftLdp') return sameReferral(t, appt) && !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
+      if (t.scenario === 'shiftDoctor') return matchesDoctor(t, appt, cand);
       if (t.scenario === 'shiftLab') return !!appt.toBM && Number(appt.toBM.id) === Number(t.source.samplingTypeId);
       return false;
+    }
+
+    function sameReferral(t, appt) {
+      return t.source.referralId == null || (appt.referral?.referralId != null
+        && String(appt.referral.referralId) === String(t.source.referralId));
+    }
+
+    function matchesDoctor(t, appt, cand) {
+      const doctor = appt.toDoctor;
+      if (!doctor || !sameReferral(t, appt)) return false;
+      if (t.source.specialityId != null && String(doctor.specialityId) !== String(t.source.specialityId)) return false;
+      if (t.source.specialityName && doctor.specialityName !== t.source.specialityName) return false;
+      const resource = doctor.availableResourceId ?? appt.availableResourceId;
+      if (sameDoctorShift(t)) return sameResource(resource, cand.resourceId);
+      return resource == null || String(resource) === String(cand.resourceId);
     }
 
     // Перечитываем список записей и ищем в нём результат мутации. listRes.ok === false
@@ -225,23 +276,51 @@
     // SessionError при повторном 401 уже ПОСЛЕ успешной записи/переноса) — такое исключение
     // не должно топить уже совершённую мутацию, поэтому оно тоже превращается в verifyFailed.
     async function verifyAppointment(t, cand, ctx) {
-      const beforeIds = new Set((ctx.appointments || []).map((a) => a.id));
+      const beforeIds = new Set((ctx.appointments || []).map((a) => String(a.id)));
       let listRes;
       try {
-        listRes = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
+        if (ctx.canVerify && !ctx.canVerify()) return { verifyFailed: true };
+        listRes = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {}, ctx.canVerify);
       } catch (e) {
         return { verifyFailed: true };
       }
       if (!listRes.ok) return { verifyFailed: true };
-      const appts = (listRes.json && listRes.json.payload && listRes.json.payload.appointment) || [];
-      const found = appts.find((a) => matches(t, a, cand, beforeIds)) || null;
-      return { found };
+      const appts = listRes.json?.payload?.appointment;
+      if (!Array.isArray(appts)) return { verifyFailed: true };
+      const found = appts.filter((a) => a?.id != null && matches(t, a, cand, beforeIds));
+      return { found: found.length === 1 ? found[0] : null };
+    }
+
+    function validateCandidate(t, cand, ctx) {
+      if (isShift(t)) {
+        const current = ctx.appointments.find((a) => String(a.id) === String(t.source.appointmentId));
+        if (!current || current.enableShift === false || toMs(current.startTime) !== toMs(t.current)
+            || toMs(current.startTime) - ctx.now < (t.minLeadMs || 0)) {
+          return { ok: false, action: 'stopTarget', message: 'Текущая запись изменилась или её нельзя перенести. Проверьте её в ЕМИАС.' };
+        }
+        const doctorId = current.toDoctor?.availableResourceId ?? current.availableResourceId;
+        if (sameDoctorShift(t) && (!current.toDoctor
+            || (doctorId != null && !sameResource(doctorId, t.source.availableResourceId)))) {
+          return doctorMismatch();
+        }
+      }
+      if (t.addressContains && !cand.address.toLowerCase().includes(t.addressContains.toLowerCase())) {
+        return { ok: false, action: 'retry', message: 'Адрес больше не подходит.' };
+      }
+      const valid = filters.pickSlots({
+        slots: [cand.slot],
+        target: { ...t, selfId: t.source.appointmentId },
+        now: ctx.now,
+        appointments: ctx.appointments,
+        addressOf: () => cand.address,
+      });
+      if (!valid.ok.length) return { ok: false, action: 'retry', message: 'Слот больше не подходит по времени или пересекается с другой записью.' };
+      return null;
     }
 
     async function act(t, cand, ctx) {
-      // Проверка относится к каждой отправке, включая повтор с referralId
-      // и повтор после обновления токена внутри api.post().
-      const post = (path, body) => api.post(path, body, false, ctx.canContinue);
+      if (requiresDoctor(t) && !sameResource(cand.resourceId, t.source.availableResourceId)) return doctorMismatch();
+      const send = (path, body) => api.post(path, body, ctx.canSend);
       const base = {
         availableResourceId: cand.resourceId, complexResourceId: cand.complexResourceId,
         startTime: cand.slot.startTime, endTime: cand.slot.endTime,
@@ -249,7 +328,7 @@
       let res;
       switch (t.scenario) {
         case 'bookLab': {
-          res = await post('v4/saOrchestrator/createAppointment', base);
+          res = await send('v4/saOrchestrator/createAppointment', base);
           break;
         }
         case 'bookDoctor': {
@@ -261,25 +340,25 @@
             body.inquiryPurposeId = t.purpose.inquiryPurposeId;
             body.inquiryPurposeCode = t.purpose.inquiryPurposeCode;
           }
-          res = await post('v4/saOrchestrator/createAppointment', body);
+          res = await send('v4/saOrchestrator/createAppointment', body);
           break;
         }
         case 'bookLdp': {
-          res = await post('v4/saOrchestrator/createAppointment', { ...base, referralId: t.source.referralId });
+          res = await send('v4/saOrchestrator/createAppointment', { ...base, referralId: t.source.referralId });
           break;
         }
         case 'shiftLab':
         case 'shiftLdp':
         case 'shiftDoctor': {
-          res = await post('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId });
+          res = await send('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId });
           // Перенос иногда проходит только со вторым параметром referralId — при отказе
           // повторяем с ним, но ТОЛЬКО при бизнес-отказе (400–499, кроме 429 и «выключить
           // цель»). При сетевой ошибке (status 0), 429 или 5xx api уже выставил паузу перед
           // следующей попыткой — слать второй запрос сразу же значит обойти эту паузу.
-          const isBusinessRejection = !res.ok && !res.cancelled && res.status >= 400 && res.status < 500 && res.status !== 429
+          const isBusinessRejection = !res.ok && res.status >= 400 && res.status < 500 && res.status !== 429
             && !(res.explained && res.explained.action === 'stopTarget');
           if (isBusinessRejection && t.source.referralId) {
-            res = await post('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId, referralId: t.source.referralId });
+            res = await send('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId, referralId: t.source.referralId });
           }
           break;
         }
@@ -287,15 +366,15 @@
           return { ok: false, verified: false, message: UNSUPPORTED_MESSAGE, action: null };
       }
 
-      if (res.cancelled) return { ok: false, verified: false, cancelled: true };
-
+      if (res.aborted) return res;
       if (!res.ok) {
         // Таймаут (status 0) или 5xx не значат, что мутация не прошла — ЕМИАС мог принять
         // запрос, но не успеть ответить вовремя. Перед вердиктом «не получилось» на всякий
         // случай перечитываем список записей: вдруг перенос/запись всё же случились.
-        if (res.status === 0 || res.status >= 500) {
+        if (res.status === 0 || res.status >= 500 || (res.status >= 200 && res.status < 300)) {
           const verify = await verifyAppointment(t, cand, ctx);
           if (verify.found) return { ok: true, verified: true, message: 'Готово', newAppointment: verify.found, action: null };
+          return { ok: true, verified: false, verifyFailed: true, message: 'Результат записи неизвестен. Проверьте записи в ЕМИАС перед повторным запуском.' };
         }
         return {
           ok: false, verified: false,
@@ -320,7 +399,7 @@
       return { ok: true, verified: true, message: 'Готово', newAppointment: verify.found, action: null };
     }
 
-    return { search, act };
+    return { search, act, validateCandidate, listDoctors };
   }
 
   const api = { createTargets };

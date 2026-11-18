@@ -42,10 +42,11 @@ test('429 и 500 просят подождать', () => {
 });
 
 test('неизвестная ошибка отдаётся как есть, но замаскированной', () => {
-  const text = 'полис ' + OMS;
+  const text = 'полис ' + OMS + ' Иванов Иван Иванович token=a-synthetic-token';
   const r = e.explain({ status: 400, code: 'WAT', text });
   assert.equal(r.action, 'retry');
   assert.ok(!r.message.includes(OMS));
+  assert.doesNotMatch(r.message, /Иванов|synthetic-token/);
 });
 
 test('полис внутри длинной цепочки цифр маскируется', () => {

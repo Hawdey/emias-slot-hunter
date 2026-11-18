@@ -31,8 +31,10 @@
       const e = toMs(slot.endTime);
       const day = slot.startTime.slice(0, 10);
       for (const a of appointments || []) {
-        if (selfId != null && a.id === selfId) continue;
+        if (selfId != null && String(a.id) === String(selfId)) continue;
+        if (typeof a.startTime !== 'string' || !Number.isFinite(toMs(a.startTime))) return false;
         if (a.startTime.slice(0, 10) !== day) continue;
+        if (!Number.isFinite(toMs(a.endTime))) return false;
         const gap = campus(a.lpuAddress) === campus(address) ? 0 : travelMs;
         if (s < toMs(a.endTime) + gap && e > toMs(a.startTime) - gap) return false;
       }
@@ -67,11 +69,14 @@
 
       for (const slot of slots) {
         const s = toMs(slot.startTime);
+        const e = toMs(slot.endTime);
+        if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s || s <= now) { reject(slot, 'некорректное или прошедшее время'); continue; }
         const day = slot.startTime.slice(0, 10);
         if (s - now < t.minLeadMs) { reject(slot, `слишком скоро (меньше ${Math.round(t.minLeadMs / 3600000)} ч)`); continue; }
         if (t.onlyDay && day !== t.onlyDay) { reject(slot, 'другой день'); continue; }
         if (t.dateFrom && day < t.dateFrom) { reject(slot, 'раньше выбранной даты'); continue; }
         if (t.dateTo && day > t.dateTo) { reject(slot, 'позже выбранной даты'); continue; }
+        if (t.deadline && day > String(t.deadline).slice(0, 10)) { reject(slot, 'позже срока направления'); continue; }
         if (t.timeFrom && slotHHMM(slot.startTime) < t.timeFrom) { reject(slot, 'раньше выбранного времени'); continue; }
         if (t.timeTo && slotHHMM(slot.startTime) > t.timeTo) { reject(slot, 'позже выбранного времени'); continue; }
         if (cur != null && s === cur) { reject(slot, 'это и есть текущая запись'); continue; }

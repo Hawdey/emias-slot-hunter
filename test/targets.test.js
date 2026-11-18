@@ -79,7 +79,7 @@ test('act для bookLab записывает и подтверждает по �
 
 test('act для переноса повторяет запрос с referralId, если первый отклонён', async () => {
   let shifts = 0;
-  const moved = { payload: { appointment: [ { id: 700000000001, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'LDP', toLdp: { ldpTypeId: 599925, ldpTypeName: 'УЗИ' } } ] } };
+  const moved = { payload: { appointment: [ { id: 700000000001, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'LDP', toLdp: { ldpTypeId: 599925, ldpTypeName: 'УЗИ' }, referral: { referralId: 900000000001 } } ] } };
   const api = fakeApi([
     ['shiftAppointment', () => { shifts++; return shifts === 1 ? { ok: false, status: 400, json: null, explained: { message: 'нет', action: 'retry' } } : { ok: true, json: { payload: {} } }; }],
     ['getAppointmentReceptionsByPatient', { ok: true, json: moved }],
@@ -277,7 +277,7 @@ test('act сообщает понятную причину и action, если �
 });
 
 test('act при сетевом сбое (status 0) не шлёт повтор с referralId, но перепроверяет список — перенос мог пройти', async () => {
-  const moved = { id: 700000000005, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'LDP', toLdp: { ldpTypeId: 599925, ldpTypeName: 'УЗИ' } };
+  const moved = { id: 700000000005, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'LDP', toLdp: { ldpTypeId: 599925, ldpTypeName: 'УЗИ' }, referral: { referralId: 900000000005 } };
   const api = fakeApi([
     ['shiftAppointment', { ok: false, status: 0, json: null, explained: { message: 'Нет связи с ЕМИАС — попробую позже.', action: 'wait' } }],
     ['getAppointmentReceptionsByPatient', { ok: true, json: { payload: { appointment: [moved] } } }],
@@ -303,6 +303,19 @@ test('act: после успешной мутации список записе�
   assert.equal(r.ok, true);
   assert.equal(r.verified, false);
   assert.equal(r.verifyFailed, true);
+});
+
+test('сбой ответа на запись с недоступной сверкой оставляет результат неопределённым', async () => {
+  const api = fakeApi([
+    ['createAppointment', { ok: false, status: 500 }],
+    ['getAppointmentReceptionsByPatient', { ok: false, status: 500 }],
+  ]);
+  const targets = createTargets({ api, filters, util });
+  const cand = { slot: { startTime: '2026-09-24T09:00:00+03:00', endTime: '2026-09-24T09:15:00+03:00' }, address: 'улица Тестовая, д. 2', resourceId: 1, complexResourceId: 2 };
+  const res = await targets.act(labTarget, cand, { now: NOW, appointments: [] });
+  assert.equal(res.verified, false);
+  assert.equal(res.verifyFailed, true);
+  assert.equal(api.calls.length, 2);
 });
 
 test('act: чтение списка после успешной мутации бросает исключение (повторный 401) — act не падает', async () => {
@@ -434,7 +447,7 @@ test('C2: 429 на первом запросе расписания остана
 
 test('act для bookDoctor шлёт createAppointment с availableResourceId/complexResourceId/startTime/endTime/referralId и целью визита', async () => {
   const booked = { payload: { appointment: [
-    { id: 700000000020, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'DOCTOR', toDoctor: { specialityName: 'Врач-эндокринолог' } },
+    { id: 700000000020, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'DOCTOR', toDoctor: { specialityName: 'Врач-эндокринолог', specialityId: 10 }, referral: { referralId: 900000000002 } },
   ] } };
   const api = fakeApi([['createAppointment', { ok: true, json: { payload: {} } }], ['getAppointmentReceptionsByPatient', { ok: true, json: booked }]]);
   const t = createTargets({ api, filters, util });
@@ -451,7 +464,7 @@ test('act для bookDoctor шлёт createAppointment с availableResourceId/co
 
 test('act для bookDoctor без цели визита не добавляет inquiryPurpose* в тело createAppointment', async () => {
   const booked = { payload: { appointment: [
-    { id: 700000000021, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'DOCTOR', toDoctor: { specialityName: 'Врач-невролог' } },
+    { id: 700000000021, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'DOCTOR', toDoctor: { specialityName: 'Врач-невролог', specialityId: 10 }, referral: { referralId: 900000000003 } },
   ] } };
   const api = fakeApi([['createAppointment', { ok: true, json: { payload: {} } }], ['getAppointmentReceptionsByPatient', { ok: true, json: booked }]]);
   const t = createTargets({ api, filters, util });
@@ -463,12 +476,14 @@ test('act для bookDoctor без цели визита не добавляет
 });
 
 test('act для bookDoctor не засчитывает запись, чей id уже был в списке до брони', async () => {
-  const stale = { id: 700000000020, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'DOCTOR', toDoctor: { specialityName: 'Врач-эндокринолог' } };
+  const stale = { id: 700000000020, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'DOCTOR', toDoctor: { specialityId: 10 }, referral: { referralId: 900000000002 } };
   const api = fakeApi([['createAppointment', { ok: true, json: { payload: {} } }], ['getAppointmentReceptionsByPatient', { ok: true, json: { payload: { appointment: [stale] } } }]]);
   const t = createTargets({ api, filters, util });
   const cand = { slot: { startTime: '2026-09-24T09:00:00+03:00', endTime: '2026-09-24T09:15:00+03:00' }, address: 'улица Тестовая, д. 2', resourceId: 200000002, complexResourceId: 300000001 };
   const r = await t.act(doctorTarget, cand, { now: NOW, appointments: [stale] });
   assert.equal(r.verified, false);
+  const wrongReferral = { ...doctorTarget, source: { ...doctorTarget.source, referralId: 'another-referral' } };
+  assert.equal((await t.act(wrongReferral, cand, { now: NOW, appointments: [] })).verified, false);
 });
 
 // ---- bookLdp — новая запись по направлению на исследование (УЗИ, ЭКГ…) ----
@@ -496,7 +511,7 @@ test('bookLdp ищет через v5/getDoctorsInfo с referralId, распис�
 
 test('act для bookLdp шлёт createAppointment с referralId и засчитывает новую запись того же вида исследования', async () => {
   const booked = { payload: { appointment: [
-    { id: 700000000030, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'LDP', toLdp: { ldpTypeId: 599930, ldpTypeName: 'Электрокардиография' } },
+    { id: 700000000030, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2', type: 'LDP', toLdp: { ldpTypeId: 599930, ldpTypeName: 'Электрокардиография' }, referral: { referralId: 900000000004 } },
   ] } };
   const api = fakeApi([['createAppointment', { ok: true, json: { payload: {} } }], ['getAppointmentReceptionsByPatient', { ok: true, json: booked }]]);
   const t = createTargets({ api, filters, util });
@@ -537,6 +552,80 @@ test('bookDoctor не считается переносом: isShift не под
 // требовал прежний id, не узнавал свою запись и дальше переносил уже
 // отменённую — ЕМИАС отвечал SA_APPOINTMENT_CANNOT_BE_CANCELED.
 const shiftCand = { slot: { startTime: '2026-09-24T09:00:00+03:00', endTime: '2026-09-24T09:15:00+03:00' }, address: 'улица Тестовая, д. 2', resourceId: 200000001, complexResourceId: 300000001 };
+
+const doctorShift = {
+  ...labTarget, scenario: 'shiftDoctor', current: '2026-10-19T08:30:00+03:00',
+  source: { appointmentId: 700000000040, availableResourceId: 200000005, specialityName: 'Врач-терапевт' },
+};
+
+function doctorsWithSlots(scheduleOwner = (id) => id) {
+  return fakeApi([
+    ['getDoctorsInfo', { ok: true, json: doctorsV5Multi }],
+    ['getAvailableResourceScheduleInfo', (body) => {
+      const json = structuredClone(schedule);
+      json.payload.availableResource.id = scheduleOwner(body.availableResourceId);
+      json.payload.availableResource.complexResource[0].id = body.complexResourceId;
+      json.payload.scheduleOfDay[0].scheduleBySlot[0].complexResourceId = body.complexResourceId;
+      return { ok: true, json };
+    }],
+  ]);
+}
+
+test('при включённом ограничении запрашивает слоты только выбранного врача', async () => {
+  const api = doctorsWithSlots();
+  const t = createTargets({ api, filters, util });
+  const result = await t.search({ ...doctorShift, sameDoctor: true }, { now: NOW, appointments: [] });
+  assert.equal(result.candidates.length, 2);
+  assert.deepEqual(new Set(result.candidates.map((c) => c.doctorName)), new Set(['Петров П.П.']));
+  assert.deepEqual(api.calls.slice(1).map((call) => call.body.availableResourceId), [200000005]);
+});
+
+test('без ограничения можно найти слоты у обоих врачей', async () => {
+  const api = doctorsWithSlots();
+  const t = createTargets({ api, filters, util });
+  const result = await t.search({ ...doctorShift, sameDoctor: false }, { now: NOW, appointments: [] });
+  assert.deepEqual(new Set(result.candidates.map((c) => c.doctorName)), new Set(['Петров П.П.', 'Сидоров С.С.']));
+});
+
+test('если выбранный врач отсутствует или не совпал с расписанием, замена не предлагается', async () => {
+  const api = doctorsWithSlots(() => 200000006);
+  const t = createTargets({ api, filters, util });
+  const ctx = { now: NOW, appointments: [] };
+  assert.equal((await t.search({ ...doctorShift, sameDoctor: true }, ctx)).candidates.length, 0);
+  const missing = { ...doctorShift, sameDoctor: true, source: { ...doctorShift.source, availableResourceId: 200000007 } };
+  assert.equal((await t.search(missing, ctx)).candidates.length, 0);
+  assert.deepEqual(api.calls.filter((call) => call.path.includes('getAvailableResource')).map((call) => call.body.availableResourceId), [200000005]);
+  const result = await t.act({ ...doctorShift, sameDoctor: true }, { ...shiftCand, resourceId: 200000006 }, ctx);
+  assert.equal(result.action, 'stopTarget');
+  assert.ok(api.calls.every((call) => !call.path.includes('shiftAppointment')));
+});
+
+test('в ручном списке нельзя выбрать врача по неоднозначному имени', async () => {
+  const json = structuredClone(doctorsV5Multi);
+  json.payload.doctorsInfo[0].availableResources[1].name = 'Петров П. П.';
+  const api = fakeApi([['getDoctorsInfo', { ok: true, json }]]);
+  const doctors = await createTargets({ api, filters, util }).listDoctors(doctorShift);
+  assert.equal(doctors.length, 2);
+  assert.ok(doctors.every((doctor) => doctor.ambiguous));
+});
+
+test('подтверждает перенос к выбранному врачу только при совпадении ресурса', async () => {
+  const moved = {
+    id: 51, startTime: shiftCand.slot.startTime, lpuAddress: shiftCand.address,
+    toDoctor: { specialityName: 'Врач-терапевт', availableResourceId: '200000005' },
+  };
+  const api = fakeApi([
+    ['shiftAppointment', { ok: true, json: { payload: {} } }],
+    ['getAppointmentReceptions', { ok: true, json: { payload: { appointment: [moved] } } }],
+  ]);
+  const t = createTargets({ api, filters, util });
+  const cand = { ...shiftCand, resourceId: 200000005 };
+  const ctx = { now: NOW, appointments: [] };
+  const target = { ...doctorShift, sameDoctor: true };
+  assert.equal((await t.act(target, cand, ctx)).verified, true);
+  delete moved.toDoctor.availableResourceId;
+  assert.equal((await t.act(target, cand, ctx)).verified, false);
+});
 
 test('перенос приёма врача: запись с новым id засчитывается, и цель получает новый id', async () => {
   const old = { id: 700000000040, startTime: '2026-10-19T08:30:00', lpuAddress: 'улица Тестовая, д. 2', toDoctor: { specialityName: 'Врач-акушер-гинеколог' } };

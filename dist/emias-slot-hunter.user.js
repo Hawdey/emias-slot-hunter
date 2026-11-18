@@ -1,18 +1,40 @@
 // ==UserScript==
-// @name         ЕМИАС: охотник за слотами
-// @namespace    https://github.com/polinalamponi/emias-slot-hunter
-// @version      0.1.6
+// @name         ЕМИАС: охотник за слотами (личная версия)
+// @namespace    emias-slot-hunter-personal
+// @version      0.1.7
 // @description  Следит за расписанием ЕМИАС и ловит освободившиеся слоты: записывает по направлению и переносит записи на более раннее время
 // @author       polinalamponi
-// @homepageURL  https://github.com/polinalamponi/emias-slot-hunter
-// @supportURL   https://github.com/polinalamponi/emias-slot-hunter/issues
-// @updateURL    https://raw.githubusercontent.com/polinalamponi/emias-slot-hunter/release/dist/emias-slot-hunter.user.js
-// @downloadURL  https://raw.githubusercontent.com/polinalamponi/emias-slot-hunter/release/dist/emias-slot-hunter.user.js
+// @homepageURL  https://github.com/Hawdey/emias-slot-hunter
+// @downloadURL  none
 // @match        https://emias.info/*
 // @run-at       document-idle
 // @grant        none
 // @noframes
 // ==/UserScript==
+
+/*
+MIT License
+
+Copyright (c) 2026 Polina
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
 
 (function () {
 'use strict';
@@ -21,7 +43,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.5';
+  const VERSION = '0.1.7';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -40,7 +62,35 @@
     return { VERSION, mskDate, mskTime, mskDateTime, toMs, slotHHMM, distTo, campus, jitter };
   }
 
-  const api = { VERSION, createUtil };
+  // Ограничиваем и ожидание заголовков, и чтение тела ответа.
+  function createTimedFetch(fetch, timeoutMs = 12000) {
+    return async (url, opts) => {
+      if (typeof url !== 'string' || !/^\/(?:api-eip\/[a-z0-9/_-]+|web-api\/refreshTokens\/)$/i.test(url)) {
+        throw new Error('Запрос за пределами разрешённых путей ЕМИАС.');
+      }
+      const controller = new AbortController();
+      let timeout;
+      const expired = new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          reject(new Error('Истекло время ожидания ответа ЕМИАС.'));
+        }, timeoutMs);
+      });
+      const request = async () => {
+        const response = await fetch(url, { ...opts, mode: 'same-origin', redirect: 'error', signal: controller.signal });
+        if (typeof response.text !== 'function') {
+          const json = await response.json();
+          return { ok: response.ok, status: response.status, json: async () => json, text: async () => JSON.stringify(json) };
+        }
+        const text = await response.text();
+        return { ok: response.ok, status: response.status, text: async () => text, json: async () => JSON.parse(text) };
+      };
+      try { return await Promise.race([request(), expired]); }
+      finally { clearTimeout(timeout); }
+    };
+  }
+
+  const api = { VERSION, createUtil, createTimedFetch };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else { root.EmiasCore = root.EmiasCore || {}; Object.assign(root.EmiasCore, api); }
 })(typeof globalThis !== 'undefined' ? globalThis : this);
@@ -79,7 +129,7 @@
     };
 
     function explain({ status, code, text }) {
-      if (code && KNOWN[code]) return KNOWN[code];
+      if (Object.hasOwn(KNOWN, code)) return KNOWN[code];
       // I4: в реальном пути 401 сюда не доходит — core/api.js сам перехватывает
       // 401 до вызова explain() (один раз продлевает сессию и повторяет запрос,
       // а при повторном 401 сразу бросает SessionError с тем же по смыслу
@@ -91,7 +141,7 @@
       if (status === 401) return { message: 'ЕМИАС перестал принимать вход. Войдите заново в другой вкладке — поиск продолжится сам.', action: 'relogin' };
       if (status === 429) return { message: 'ЕМИАС просит не частить — пауза 30 секунд.', action: 'wait' };
       if (status >= 500) return { message: 'ЕМИАС временно отвечает ошибкой — пауза 30 секунд.', action: 'wait' };
-      return { message: 'Непонятный ответ ЕМИАС: ' + mask(text).slice(0, 300), action: 'retry' };
+      return { message: 'ЕМИАС вернул неожиданный ответ. Повторите проверку или откройте записи на сайте.', action: 'retry' };
     }
 
     return { mask, explain };
@@ -136,8 +186,10 @@
       const e = toMs(slot.endTime);
       const day = slot.startTime.slice(0, 10);
       for (const a of appointments || []) {
-        if (selfId != null && a.id === selfId) continue;
+        if (selfId != null && String(a.id) === String(selfId)) continue;
+        if (typeof a.startTime !== 'string' || !Number.isFinite(toMs(a.startTime))) return false;
         if (a.startTime.slice(0, 10) !== day) continue;
+        if (!Number.isFinite(toMs(a.endTime))) return false;
         const gap = campus(a.lpuAddress) === campus(address) ? 0 : travelMs;
         if (s < toMs(a.endTime) + gap && e > toMs(a.startTime) - gap) return false;
       }
@@ -172,11 +224,14 @@
 
       for (const slot of slots) {
         const s = toMs(slot.startTime);
+        const e = toMs(slot.endTime);
+        if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s || s <= now) { reject(slot, 'некорректное или прошедшее время'); continue; }
         const day = slot.startTime.slice(0, 10);
         if (s - now < t.minLeadMs) { reject(slot, `слишком скоро (меньше ${Math.round(t.minLeadMs / 3600000)} ч)`); continue; }
         if (t.onlyDay && day !== t.onlyDay) { reject(slot, 'другой день'); continue; }
         if (t.dateFrom && day < t.dateFrom) { reject(slot, 'раньше выбранной даты'); continue; }
         if (t.dateTo && day > t.dateTo) { reject(slot, 'позже выбранной даты'); continue; }
+        if (t.deadline && day > String(t.deadline).slice(0, 10)) { reject(slot, 'позже срока направления'); continue; }
         if (t.timeFrom && slotHHMM(slot.startTime) < t.timeFrom) { reject(slot, 'раньше выбранного времени'); continue; }
         if (t.timeTo && slotHHMM(slot.startTime) > t.timeTo) { reject(slot, 'позже выбранного времени'); continue; }
         if (cur != null && s === cur) { reject(slot, 'это и есть текущая запись'); continue; }
@@ -203,87 +258,110 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this);
 
 /* ---- core/session.js ---- */
-// core/session.js
+// Токены охотника хранятся только в памяти и действуют в рамках входа сайта.
 (function (root) {
   'use strict';
 
   const SITE_KEY = 'persist:sessionAuth';
-  const MY_KEY = 'emiasSlotHunter:auth';
+  const LEGACY_KEY = 'emiasSlotHunter:auth';
+
+  function selectedPolicy(storage) {
+    try { return JSON.parse(JSON.parse(storage.getItem('persist:persist')).persistOmsNumber) || null; }
+    catch (e) { return null; }
+  }
+
+  function sessionError(message = 'Войдите в ЕМИАС и настройте поиск заново.') {
+    return Object.assign(new Error(message), { name: 'SessionError' });
+  }
 
   function createSession({ storage, fetch, now }) {
-    let auth = null;            // { access, refresh, at }
+    let site = null;
+    let auth = null;
     let identity = { oms: null, birth: null };
-    let ttlMs = 3600000;
-    let refreshedAt = 0;
     let refreshing = null;
+    let refreshedAt = 0;
+
+    try { storage.removeItem(LEGACY_KEY); } catch (e) { /* хранилище может быть недоступно */ }
 
     function readSite() {
       try {
-        const raw = storage.getItem(SITE_KEY);
-        if (!raw) return null;
-        const s = JSON.parse(raw);
-        let at = 0;
-        try { at = new Date(JSON.parse(s.ctime)).getTime() || 0; } catch (e) { at = 0; }
-        return { access: JSON.parse(s.accessToken), refresh: JSON.parse(s.refreshToken), at };
+        const raw = JSON.parse(storage.getItem(SITE_KEY));
+        const access = JSON.parse(raw.accessToken);
+        if (typeof access !== 'string' || !access) return null;
+        const parse = (value) => { try { return JSON.parse(value); } catch (e) { return null; } };
+        return { access, refresh: parse(raw.refreshToken), idToken: parse(raw.idToken) };
       } catch (e) { return null; }
-    }
-    function readMine() {
-      try {
-        const a = JSON.parse(storage.getItem(MY_KEY));
-        return a && a.access && a.refresh ? a : null;
-      } catch (e) { return null; }
-    }
-    function read() {
-      const site = readSite();
-      const mine = readMine();
-      const best = mine && (!site || (mine.at || 0) > site.at) ? mine : site;
-      if (!best) throw new Error('нет входа в ЕМИАС: войдите на сайте и попробуйте снова');
-      auth = auth && auth.at > (best.at || 0) ? auth : best;
-      return auth;
     }
 
-    async function tryRefresh(refreshToken) {
-      const r = await fetch('/web-api/refreshTokens/', {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-App': 'portal' },
-        body: JSON.stringify({ refreshToken }),
-      });
-      const j = r.ok ? await r.json().catch(() => null) : null;
-      if (!r.ok || !j || !j.access_token) return false;
-      auth = { access: j.access_token, refresh: j.refresh_token || refreshToken, at: now() };
-      ttlMs = (j.expires_in || 3600) * 1000;
-      refreshedAt = now();
-      try { storage.setItem(MY_KEY, JSON.stringify(auth)); } catch (e) { /* приватный режим */ }
-      return true;
+    function clear() {
+      site = null;
+      auth = null;
+      identity = { oms: null, birth: null };
+      refreshing = null;
+      refreshedAt = 0;
+    }
+
+    function clearAfter(pending) {
+      const scope = site;
+      const clearIfUnchanged = () => { if (site === scope) clear(); };
+      pending.then(clearIfUnchanged, clearIfUnchanged);
+    }
+
+    function read() {
+      clear();
+      const current = readSite();
+      if (!current) throw sessionError('Нет входа в ЕМИАС. Войдите на сайте.');
+      site = { ...current, policy: selectedPolicy(storage) };
+      auth = { access: site.access, refresh: site.refresh };
+      return site;
+    }
+
+    function assertContext(expected = site) {
+      const current = readSite();
+      if (!expected || expected !== site) throw sessionError();
+      if (!current || (current.idToken || current.access) !== (site.idToken || site.access)
+          || selectedPolicy(storage) !== site.policy) {
+        clear();
+        throw sessionError('Вход или выбранный полис изменился. Настройте поиск заново.');
+      }
+      if (current.access !== site.access || current.refresh !== site.refresh) {
+        site.access = current.access;
+        site.refresh = current.refresh;
+        auth = { access: site.access, refresh: site.refresh };
+      }
+      return site;
     }
 
     function refresh() {
+      const scope = assertContext();
       if (refreshing) return refreshing;
-      refreshing = (async () => {
-        const seen = new Set();
-        const candidates = [auth, readMine(), readSite()].filter(Boolean);
-        for (const c of candidates) {
-          if (!c.refresh || seen.has(c.refresh)) continue;
-          seen.add(c.refresh);
-          if (await tryRefresh(c.refresh)) return true;
-        }
-        return false;
-      })().finally(() => { refreshing = null; });
-      return refreshing;
+      const previous = auth;
+      if (!previous.refresh) return Promise.resolve(false);
+      const pending = (async () => {
+        const r = await fetch('/web-api/refreshTokens/', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-App': 'portal' },
+          body: JSON.stringify({ refreshToken: previous.refresh }),
+        });
+        const j = r.ok ? await r.json().catch(() => null) : null;
+        assertContext(scope);
+        // Если сайт уже обновил вход, используем его ответ.
+        if (auth !== previous) return true;
+        if (typeof j?.access_token !== 'string' || !j.access_token) return false;
+        auth = { access: j.access_token, refresh: j.refresh_token || previous.refresh };
+        refreshedAt = now();
+        return true;
+      })().finally(() => { if (refreshing === pending) refreshing = null; });
+      refreshing = pending;
+      return pending;
     }
 
     return {
-      read, refresh,
-      token: () => (auth || read()).access,
-      setAuth: (a) => { auth = a; },
+      read, clear, clearAfter, assertContext, refresh,
+      token: () => { assertContext(); return auth.access; },
       identity: () => identity,
-      setIdentity: (v) => { identity = { ...identity, ...v }; },
-      get ttlMs() { return ttlMs; },
+      setIdentity: (value, scope) => { assertContext(scope); identity = value; },
       get refreshedAt() { return refreshedAt; },
-      needsRefresh: (fraction) => {
-        const age = Math.max(refreshedAt, (auth && auth.at) || 0);
-        return !age || now() - age > ttlMs * fraction;
-      },
     };
   }
 
@@ -313,19 +391,19 @@
     // Общая часть post() и get(): заголовки, сетевой бэкофф, продление сессии
     // по 401, разбор ответа. body === undefined → запрос без тела (GET), с
     // телом → Content-Type и JSON.stringify (POST).
-    async function request(method, path, body, retried, canContinue) {
-      if (canContinue && !canContinue()) {
-        return { ok: false, cancelled: true, status: 0, json: null, explained: null };
+    async function request(method, path, body, retried, canSend) {
+      if (canSend && !canSend()) return { ok: false, aborted: true };
+      const headers = { Accept: 'application/json', 'EI-Token': session.token(), 'X-App': 'portal' };
+      const opts = { method, headers };
+      if (body !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
       }
       let r;
+      let text;
       try {
-        const headers = { Accept: 'application/json', 'EI-Token': session.token(), 'X-App': 'portal' };
-        const opts = { method, headers };
-        if (body !== undefined) {
-          headers['Content-Type'] = 'application/json';
-          opts.body = JSON.stringify(body);
-        }
         r = await fetch('/api-eip/' + path, opts);
+        text = await r.text();
       } catch (e) {
         // Увеличиваем паузу при сетевой ошибке: 30s → 60s → 120s → 300s
         netStep = Math.min(netStep + 1, NET_STEPS.length - 1);
@@ -335,16 +413,17 @@
       // Сброс счётчика сетевых ошибок при успешном соединении
       netStep = -1;
 
-      const text = await r.text();
       let json = null;
       try { json = JSON.parse(text); } catch (e) { json = null; }
 
       // 401: пытаемся один раз продлить сессию и повторить запрос
       if (r.status === 401 && !retried) {
-        if (canContinue && !canContinue()) {
-          return { ok: false, cancelled: true, status: r.status, json, explained: null };
-        }
-        if (await session.refresh()) return request(method, path, body, true, canContinue);
+        if (canSend && !canSend()) return { ok: false, aborted: true };
+        let refreshed = false;
+        try { refreshed = await session.refresh(); }
+        catch (e) { if (e?.name === 'SessionError') throw e; }
+        if (canSend && !canSend()) return { ok: false, aborted: true };
+        if (refreshed) return request(method, path, body, true, canSend);
       }
       // Повторный 401 — сессия не продлевается. Текст этого сообщения попадает
       // пользователю на глаза как есть (userscript/ui-dom.js onSessionLost
@@ -353,7 +432,7 @@
       // техническим языком — и той же формулировкой, что уже даёт errors.js
       // для 401 (см. explain()), чтобы текст не расходился в зависимости от
       // того, через какой путь сессия оказалась потеряна.
-      if (r.status === 401) throw new SessionError('Вход в ЕМИАС закончился. Войдите заново в другой вкладке — поиск продолжится сам.');
+      if (r.status === 401) throw new SessionError('Вход в ЕМИАС закончился. Войдите заново и настройте поиск.');
       // 429 и 5xx ошибки требуют паузу
       if (r.status === 429 || r.status >= 500) backoffUntil = now() + 30000;
 
@@ -374,9 +453,9 @@
       };
     }
 
-    function post(path, body, retried, canContinue) {
+    function post(path, body, canSend) {
       const id = session.identity();
-      return request('POST', path, { omsNumber: id.oms, birthDate: id.birth, ...body }, retried, canContinue);
+      return request('POST', path, { omsNumber: id.oms, birthDate: id.birth, ...body }, false, canSend);
     }
 
     // GET без тела и без omsNumber/birthDate — используется до того, как
@@ -424,7 +503,7 @@
       // Обрабатываем существующие записи как цели переноса
       for (const a of appts) {
         // IMPORTANT 2: проверяем наличие startTime перед конкатенацией
-        const current = a.startTime ? (a.startTime + '+03:00') : null;
+        const current = a.startTime && !/(?:Z|[+-]\d\d:?\d\d)$/.test(a.startTime) ? a.startTime + '+03:00' : a.startTime || null;
         const common = { current, address: a.lpuAddress || null, deadline: null, supported: !!a.enableShift,
           unsupportedReason: a.enableShift ? null : 'ЕМИАС не разрешает переносить эту запись' };
         // Вид записи определяем по содержимому, а не по a.type: на живом сайте
@@ -437,7 +516,11 @@
             source: { appointmentId: a.id, ldpTypeId: Number(a.toLdp.ldpTypeId), referralId: a.referral && a.referral.referralId, lpuId: a.lpuId } });
         } else if (a.toDoctor) {
           out.push({ id: 'appt:' + a.id, scenario: 'shiftDoctor', title: a.toDoctor.specialityName, ...common,
-            source: { appointmentId: a.id, specialityName: a.toDoctor.specialityName, referralId: a.referral && a.referral.referralId, lpuId: a.lpuId } });
+            source: {
+              appointmentId: a.id, specialityName: a.toDoctor.specialityName, referralId: a.referral?.referralId, lpuId: a.lpuId,
+              availableResourceId: a.toDoctor.availableResourceId ?? a.availableResourceId ?? null,
+              doctorName: a.toDoctor.doctorFio || null,
+            } });
         } else {
           // Непонятную запись не прячем: человек должен видеть, что скрипт её
           // заметил, но пока не умеет с ней работать.
@@ -528,7 +611,7 @@
     // т.к. ЕМИАС иногда помечает недоступность прямо на самом ресурсе, а не
     // только через обёртку notAvailableResources. Дедуплицируем по id — один
     // и тот же кабинет может встретиться в дереве несколько раз.
-    function collectResources(payload) {
+    function collectResources(payload, includeUnavailable = false) {
       const out = [];
       const seen = new Set();
       (function walk(node, notAvail) {
@@ -538,8 +621,9 @@
         for (const [k, v] of Object.entries(node)) {
           if (v && typeof v === 'object') walk(v, notAvail || selfNotAvail || /notAvailable/i.test(k));
         }
-        if (!notAvail && !selfNotAvail && node.id && Array.isArray(node.complexResource) && 'arType' in node && !seen.has(node.id)) {
-          seen.add(node.id);
+        if ((includeUnavailable || (!notAvail && !selfNotAvail))
+            && node.id && Array.isArray(node.complexResource) && 'arType' in node && !seen.has(String(node.id))) {
+          seen.add(String(node.id));
           out.push(node);
         }
       })(payload, false);
@@ -561,7 +645,7 @@
       const out = [];
       for (const day of (payload && payload.scheduleOfDay) || [])
         for (const sb of day.scheduleBySlot || [])
-          if (!sb.complexResourceId || sb.complexResourceId === crId)
+          if (!sb.complexResourceId || String(sb.complexResourceId) === String(crId))
             for (const sl of sb.slot || []) out.push(sl);
       return out.sort((a, b) => toMs(a.startTime) - toMs(b.startTime));
     }
@@ -570,6 +654,13 @@
     // существующих записей и требуют appointmentId в каждом запросе к ЕМИАС.
     const isShift = (t) => !['bookLab', 'bookDoctor', 'bookLdp'].includes(t.scenario);
     const isReferralBooking = (t) => t.scenario === 'bookDoctor' || t.scenario === 'bookLdp';
+    const isDoctor = (t) => t.scenario === 'shiftDoctor' || t.scenario === 'bookDoctor';
+    const sameResource = (a, b) => a != null && a !== '' && b != null && b !== '' && String(a) === String(b);
+    const sameDoctorShift = (t) => t.scenario === 'shiftDoctor' && t.sameDoctor === true;
+    const requiresDoctor = (t) => sameDoctorShift(t) || (t.scenario === 'bookDoctor' && !!t.source.availableResourceId);
+    const doctorMismatch = () => ({
+      ok: false, action: 'stopTarget', message: 'Не удалось подтвердить выбранного врача. Настройте поиск заново.',
+    });
 
     // Период поиска: не раньше сегодняшнего дня (и не раньше dateFrom цели).
     // Верхняя граница — в таком порядке: onlyDay; день текущей записи (для
@@ -606,6 +697,20 @@
       return api.post('v5/saOrchestrator/getDoctorsInfo', { appointmentId: t.source.appointmentId, purposeReceptionForm: 'personal' });
     }
 
+    async function listDoctors(option) {
+      if (option.scenario !== 'shiftDoctor') return [];
+      const res = await listResources(option);
+      if (!res.ok) throw new Error(res.explained?.message || 'Не удалось получить список врачей ЕМИАС.');
+      const doctors = collectResources(res.json?.payload, true)
+        .filter((r) => typeof r.name === 'string' && r.name.trim())
+        .map((r) => ({ id: r.id, name: r.name.trim() }));
+      const key = (name) => name.toLowerCase().replace(/[.\s]+/g, '');
+      const counts = new Map();
+      for (const { name } of doctors) counts.set(key(name), (counts.get(key(name)) || 0) + 1);
+      return doctors.map((doctor) => ({ ...doctor, ambiguous: counts.get(key(doctor.name)) > 1 }))
+        .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+    }
+
     async function search(t, ctx) {
       if (!SUPPORTED_SCENARIOS.has(t.scenario)) {
         return { candidates: [], rejected: [], notes: [UNSUPPORTED_MESSAGE], action: null };
@@ -615,6 +720,10 @@
       // не делаем вообще никаких запросов, а сразу объясняем, чего не хватает.
       if (t.scenario === 'bookDoctor' && t.source.needPurpose && !t.purpose) {
         return { candidates: [], rejected: [], notes: [NEED_PURPOSE_MESSAGE], action: null };
+      }
+      if (sameDoctorShift(t) && !t.source.availableResourceId) {
+        const failure = doctorMismatch();
+        return { candidates: [], rejected: [], notes: [failure.message], action: failure.action };
       }
       const p = period(t, ctx.now);
       const notes = [];
@@ -628,10 +737,11 @@
         };
       }
       let resources = collectResources(res.json && res.json.payload);
-      // Направление к конкретному врачу (availableResourceId уже известен из
-      // getAssignmentsReferralsInfo) — не предлагаем записаться к другому врачу.
-      if (t.scenario === 'bookDoctor' && t.source.availableResourceId) {
-        resources = resources.filter((r) => String(r.id) === String(t.source.availableResourceId));
+      if (requiresDoctor(t)) {
+        resources = resources.filter((r) => sameResource(r.id, t.source.availableResourceId));
+        if (!resources.length) {
+          return { candidates: [], rejected: [], notes: ['ЕМИАС не предлагает расписание выбранного врача.'], action: null };
+        }
       }
       if (!resources.length) return { candidates: [], rejected: [], notes: ['Свободных кабинетов или врачей сейчас нет'], action: null };
 
@@ -639,6 +749,7 @@
       let rejected = [];
       let addressMismatch = 0;
       let addressUnknown = 0;
+      let doctorUnknown = false;
       // C2: без этой проверки цикл продолжал бы слать getAvailableResourceScheduleInfo
       // по всем оставшимся кабинетам/врачам даже после того, как ЕМИАС уже ответил 429 —
       // от одной цели с десятками ресурсов в один тик могло уйти десятки запросов подряд.
@@ -648,6 +759,7 @@
       resourceLoop:
       for (const r of resources) {
         for (const cr of r.complexResource) {
+          if (ctx.active && !ctx.active()) break resourceLoop;
           if (ctx.now < api.backoffUntil()) { pausedByBackoff = true; break resourceLoop; }
           const body = { availableResourceId: r.id, complexResourceId: cr.id, period: p };
           if (isShift(t)) body.appointmentId = t.source.appointmentId;
@@ -663,10 +775,15 @@
             action = (s.explained && s.explained.action) || action;
             continue;
           }
-          const address = scheduleAddress(s.json.payload, cr.id);
+          const payload = s.json?.payload;
+          if (sameDoctorShift(t) && !sameResource(payload?.availableResource?.id, r.id)) {
+            doctorUnknown = true;
+            continue;
+          }
+          const address = scheduleAddress(payload, cr.id);
           if (!address) { addressUnknown++; continue; }
           if (t.addressContains && !address.toLowerCase().includes(String(t.addressContains).toLowerCase())) { addressMismatch++; continue; }
-          const slots = scheduleSlots(s.json.payload, cr.id);
+          const slots = scheduleSlots(payload, cr.id);
           const picked = filters.pickSlots({
             slots,
             target: { ...t, selfId: t.source.appointmentId || null },
@@ -676,13 +793,17 @@
           // строки в notes человек видел бы пустой список без объяснения причины.
           if (picked.skipped) notes.push(picked.skipped);
           rejected = rejected.concat(picked.rejected.map((x) => ({ ...x, address })));
-          for (const slot of picked.ok) candidates.push({ slot, address, resourceId: r.id, complexResourceId: cr.id, name: r.name });
+          for (const slot of picked.ok) candidates.push({
+            slot, address, resourceId: r.id, complexResourceId: cr.id, name: r.name,
+            doctorName: isDoctor(t) ? (r.name || t.source.doctorName || null) : null,
+          });
         }
       }
       const compare = filters.slotComparator(t);
       candidates.sort((a, b) => compare(a.slot, b.slot));
       if (addressUnknown) notes.push(`Не удалось определить адрес ${addressUnknown} кабинет(ов) в расписании — пропущены`);
       if (addressMismatch) notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`);
+      if (doctorUnknown) notes.push('ЕМИАС вернул расписание без подтверждения выбранного врача. Оно пропущено.');
       if (pausedByBackoff) notes.push('ЕМИАС попросил паузу — часть кабинетов не проверена, продолжу на следующей проверке');
       return { candidates, rejected, notes, action };
     }
@@ -702,28 +823,41 @@
       if (toMs(appt.startTime) !== toMs(cand.slot.startTime)) return false;
       if (campus(appt.lpuAddress) !== campus(cand.address)) return false;
       if (t.scenario === 'bookLab') {
-        if (beforeIds.has(appt.id)) return false;
+        if (beforeIds.has(String(appt.id))) return false;
         return !!appt.toBM && Number(appt.toBM.id) === Number(t.source.samplingTypeId);
       }
       if (t.scenario === 'bookDoctor') {
-        if (beforeIds.has(appt.id)) return false;
-        return !!appt.toDoctor;
+        if (beforeIds.has(String(appt.id))) return false;
+        return matchesDoctor(t, appt, cand);
       }
       if (t.scenario === 'bookLdp') {
-        if (beforeIds.has(appt.id)) return false;
-        return !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
+        if (beforeIds.has(String(appt.id))) return false;
+        return sameReferral(t, appt) && !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
       }
       // Перенос: ЕМИАС выдаёт перенесённой записи новый id (проверено на живом
       // сайте — и для крови, и для приёма врача). Поэтому своя запись — либо с
       // прежним id, либо новая, которой не было в списке до переноса. Запись,
       // которая уже была до переноса под другим id, — чужая.
-      if (appt.id !== t.source.appointmentId && beforeIds.has(appt.id)) return false;
-      if (t.scenario === 'shiftLdp') return !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
-      if (t.scenario === 'shiftDoctor') {
-        return !!appt.toDoctor && (!t.source.specialityName || appt.toDoctor.specialityName === t.source.specialityName);
-      }
+      if (String(appt.id) !== String(t.source.appointmentId) && beforeIds.has(String(appt.id))) return false;
+      if (t.scenario === 'shiftLdp') return sameReferral(t, appt) && !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
+      if (t.scenario === 'shiftDoctor') return matchesDoctor(t, appt, cand);
       if (t.scenario === 'shiftLab') return !!appt.toBM && Number(appt.toBM.id) === Number(t.source.samplingTypeId);
       return false;
+    }
+
+    function sameReferral(t, appt) {
+      return t.source.referralId == null || (appt.referral?.referralId != null
+        && String(appt.referral.referralId) === String(t.source.referralId));
+    }
+
+    function matchesDoctor(t, appt, cand) {
+      const doctor = appt.toDoctor;
+      if (!doctor || !sameReferral(t, appt)) return false;
+      if (t.source.specialityId != null && String(doctor.specialityId) !== String(t.source.specialityId)) return false;
+      if (t.source.specialityName && doctor.specialityName !== t.source.specialityName) return false;
+      const resource = doctor.availableResourceId ?? appt.availableResourceId;
+      if (sameDoctorShift(t)) return sameResource(resource, cand.resourceId);
+      return resource == null || String(resource) === String(cand.resourceId);
     }
 
     // Перечитываем список записей и ищем в нём результат мутации. listRes.ok === false
@@ -732,23 +866,51 @@
     // SessionError при повторном 401 уже ПОСЛЕ успешной записи/переноса) — такое исключение
     // не должно топить уже совершённую мутацию, поэтому оно тоже превращается в verifyFailed.
     async function verifyAppointment(t, cand, ctx) {
-      const beforeIds = new Set((ctx.appointments || []).map((a) => a.id));
+      const beforeIds = new Set((ctx.appointments || []).map((a) => String(a.id)));
       let listRes;
       try {
-        listRes = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
+        if (ctx.canVerify && !ctx.canVerify()) return { verifyFailed: true };
+        listRes = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {}, ctx.canVerify);
       } catch (e) {
         return { verifyFailed: true };
       }
       if (!listRes.ok) return { verifyFailed: true };
-      const appts = (listRes.json && listRes.json.payload && listRes.json.payload.appointment) || [];
-      const found = appts.find((a) => matches(t, a, cand, beforeIds)) || null;
-      return { found };
+      const appts = listRes.json?.payload?.appointment;
+      if (!Array.isArray(appts)) return { verifyFailed: true };
+      const found = appts.filter((a) => a?.id != null && matches(t, a, cand, beforeIds));
+      return { found: found.length === 1 ? found[0] : null };
+    }
+
+    function validateCandidate(t, cand, ctx) {
+      if (isShift(t)) {
+        const current = ctx.appointments.find((a) => String(a.id) === String(t.source.appointmentId));
+        if (!current || current.enableShift === false || toMs(current.startTime) !== toMs(t.current)
+            || toMs(current.startTime) - ctx.now < (t.minLeadMs || 0)) {
+          return { ok: false, action: 'stopTarget', message: 'Текущая запись изменилась или её нельзя перенести. Проверьте её в ЕМИАС.' };
+        }
+        const doctorId = current.toDoctor?.availableResourceId ?? current.availableResourceId;
+        if (sameDoctorShift(t) && (!current.toDoctor
+            || (doctorId != null && !sameResource(doctorId, t.source.availableResourceId)))) {
+          return doctorMismatch();
+        }
+      }
+      if (t.addressContains && !cand.address.toLowerCase().includes(t.addressContains.toLowerCase())) {
+        return { ok: false, action: 'retry', message: 'Адрес больше не подходит.' };
+      }
+      const valid = filters.pickSlots({
+        slots: [cand.slot],
+        target: { ...t, selfId: t.source.appointmentId },
+        now: ctx.now,
+        appointments: ctx.appointments,
+        addressOf: () => cand.address,
+      });
+      if (!valid.ok.length) return { ok: false, action: 'retry', message: 'Слот больше не подходит по времени или пересекается с другой записью.' };
+      return null;
     }
 
     async function act(t, cand, ctx) {
-      // Проверка относится к каждой отправке, включая повтор с referralId
-      // и повтор после обновления токена внутри api.post().
-      const post = (path, body) => api.post(path, body, false, ctx.canContinue);
+      if (requiresDoctor(t) && !sameResource(cand.resourceId, t.source.availableResourceId)) return doctorMismatch();
+      const send = (path, body) => api.post(path, body, ctx.canSend);
       const base = {
         availableResourceId: cand.resourceId, complexResourceId: cand.complexResourceId,
         startTime: cand.slot.startTime, endTime: cand.slot.endTime,
@@ -756,7 +918,7 @@
       let res;
       switch (t.scenario) {
         case 'bookLab': {
-          res = await post('v4/saOrchestrator/createAppointment', base);
+          res = await send('v4/saOrchestrator/createAppointment', base);
           break;
         }
         case 'bookDoctor': {
@@ -768,25 +930,25 @@
             body.inquiryPurposeId = t.purpose.inquiryPurposeId;
             body.inquiryPurposeCode = t.purpose.inquiryPurposeCode;
           }
-          res = await post('v4/saOrchestrator/createAppointment', body);
+          res = await send('v4/saOrchestrator/createAppointment', body);
           break;
         }
         case 'bookLdp': {
-          res = await post('v4/saOrchestrator/createAppointment', { ...base, referralId: t.source.referralId });
+          res = await send('v4/saOrchestrator/createAppointment', { ...base, referralId: t.source.referralId });
           break;
         }
         case 'shiftLab':
         case 'shiftLdp':
         case 'shiftDoctor': {
-          res = await post('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId });
+          res = await send('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId });
           // Перенос иногда проходит только со вторым параметром referralId — при отказе
           // повторяем с ним, но ТОЛЬКО при бизнес-отказе (400–499, кроме 429 и «выключить
           // цель»). При сетевой ошибке (status 0), 429 или 5xx api уже выставил паузу перед
           // следующей попыткой — слать второй запрос сразу же значит обойти эту паузу.
-          const isBusinessRejection = !res.ok && !res.cancelled && res.status >= 400 && res.status < 500 && res.status !== 429
+          const isBusinessRejection = !res.ok && res.status >= 400 && res.status < 500 && res.status !== 429
             && !(res.explained && res.explained.action === 'stopTarget');
           if (isBusinessRejection && t.source.referralId) {
-            res = await post('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId, referralId: t.source.referralId });
+            res = await send('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId, referralId: t.source.referralId });
           }
           break;
         }
@@ -794,15 +956,15 @@
           return { ok: false, verified: false, message: UNSUPPORTED_MESSAGE, action: null };
       }
 
-      if (res.cancelled) return { ok: false, verified: false, cancelled: true };
-
+      if (res.aborted) return res;
       if (!res.ok) {
         // Таймаут (status 0) или 5xx не значат, что мутация не прошла — ЕМИАС мог принять
         // запрос, но не успеть ответить вовремя. Перед вердиктом «не получилось» на всякий
         // случай перечитываем список записей: вдруг перенос/запись всё же случились.
-        if (res.status === 0 || res.status >= 500) {
+        if (res.status === 0 || res.status >= 500 || (res.status >= 200 && res.status < 300)) {
           const verify = await verifyAppointment(t, cand, ctx);
           if (verify.found) return { ok: true, verified: true, message: 'Готово', newAppointment: verify.found, action: null };
+          return { ok: true, verified: false, verifyFailed: true, message: 'Результат записи неизвестен. Проверьте записи в ЕМИАС перед повторным запуском.' };
         }
         return {
           ok: false, verified: false,
@@ -827,7 +989,7 @@
       return { ok: true, verified: true, message: 'Готово', newAppointment: verify.found, action: null };
     }
 
-    return { search, act };
+    return { search, act, validateCandidate, listDoctors };
   }
 
   const api = { createTargets };
@@ -851,17 +1013,6 @@
     return 'dr' + Math.abs(h);
   }
 
-  // Ключ кандидата — чтобы после «не смог проверить» не повторять попытку
-  // ровно на том же слоте прямо на следующем тике (риск задвоить запись).
-  function candidateKey(cand) {
-    return cand.resourceId + ':' + cand.complexResourceId + ':' + cand.slot.startTime;
-  }
-
-  // Срок жизни метки «не тот же слот» после verifyFailed. Если слот всё это
-  // время остаётся единственным кандидатом, цель не должна зависать на нём
-  // бессрочно — по истечении срока попытка на том же слоте снова разрешена.
-  const VERIFY_FAILED_TTL_MS = 10 * 60 * 1000;
-
   // Поля, которые finish() может изменить сам при keepImproving после
   // успешной мутации (перенос на более удобное время). Их исключаем из
   // отпечатка гейта холостого прогона — иначе успешный перенос будет каждый
@@ -874,9 +1025,6 @@
   }
 
   function createRunner({ targets, api, session, timer, now, emit, config }) {
-    // running снова станет true при перезапуске, но старые запросы всё ещё
-    // могут ждать ответа. Номер запуска не даёт им продолжить новую охоту.
-    let runId = 0;
     const state = {
       running: false,
       list: [],
@@ -891,9 +1039,14 @@
       lastOkAt: 0,
       staleNotified: false,
       pending: {},
-      verifyFailedKey: {},
       leadershipHandlers: [],
     };
+    let generation = 0;
+    let offerSequence = 0;
+    let booking = null;
+    const isCurrent = (run) => state.running && run === generation
+      && state.confirmed === gateFingerprint(state.list);
+    const aborted = () => ({ ok: false, aborted: true, message: 'Запись больше не актуальна.' });
 
     const log = (msg) => emit('log', { at: now(), msg });
     // Нижняя граница интервала — 30 секунд, чтобы не нагружать ЕМИАС, даже
@@ -901,10 +1054,12 @@
     const interval = () => Math.max(config.minIntervalMs, config.slowMs);
 
     function setTargets(list) {
+      const wasRunning = state.running;
+      if (wasRunning) stop();
+      else generation++;
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
       state.pending = {};
-      state.verifyFailedKey = {};
       for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
@@ -912,11 +1067,16 @@
       // id старого отчёта, снятого по прежнему списку целей.
       state.confirmed = null;
       state.lastReport = null;
+      if (wasRunning) emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
     }
 
     async function appointments() {
       const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
-      return (r.json && r.json.payload && r.json.payload.appointment) || [];
+      const list = r.json?.payload?.appointment;
+      if (!r.ok || !Array.isArray(list) || list.some((a) => a?.id == null || typeof a.startTime !== 'string')) {
+        throw new Error('Не удалось получить список записей ЕМИАС. Запись приостановлена до успешной проверки.');
+      }
+      return list;
     }
 
     // Запись, которая уже есть по направлению цели новой записи (bookLab,
@@ -952,11 +1112,13 @@
         emit('targetDone', { targetId: t.id, title: t.title, message });
         return true;
       }
-      t.current = a.startTime + '+03:00';
+      t.current = /(?:Z|[+-]\d\d:?\d\d)$/.test(a.startTime) ? a.startTime : a.startTime + '+03:00';
       if (t.scenario === 'bookDoctor') {
         t.source = {
           ...t.source, appointmentId: a.id, lpuId: a.lpuId || t.source.lpuId,
           specialityName: (a.toDoctor && a.toDoctor.specialityName) || t.title,
+          availableResourceId: a.toDoctor?.availableResourceId ?? a.availableResourceId ?? null,
+          doctorName: a.toDoctor?.doctorFio || null,
         };
         t.scenario = 'shiftDoctor';
       } else if (t.scenario === 'bookLdp') {
@@ -994,17 +1156,21 @@
     }
 
     async function dryRun() {
+      const version = generation;
       const appts = await appointments();
+      if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
       const items = [];
       for (const t of state.list) {
-        adoptExisting(t, appts);
-        if (state.byId[t.id].state === 'done') {
-          items.push({ targetId: t.id, title: t.title, would: null, waiting: false, warnings: [], notes: [state.byId[t.id].note] });
+        const existing = existingAppointment(t, appts);
+        if (existing) {
+          const note = t.keepImproving ? 'По направлению уже есть запись. Поиск будет искать время для переноса.'
+            : 'По направлению уже есть запись. Новая запись не требуется.';
+          items.push({ targetId: t.id, title: t.title, would: null, waiting: false, warnings: [], notes: [note] });
           continue;
         }
         let r;
         try {
-          r = await targets.search(t, { now: now(), appointments: appts });
+          r = await targets.search(t, { now: now(), appointments: appts, active: () => version === generation });
         } catch (e) {
           // Холостой прогон не должен падать целиком из-за одной сбойной
           // цели — иначе человек не увидит отчёт по остальным целям и не
@@ -1015,15 +1181,17 @@
           });
           continue;
         }
+        if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
         const best = r.candidates[0] || null;
         items.push({
           targetId: t.id, title: t.title,
-          would: best ? { ...best.slot, address: best.address } : null,
+          would: best ? { ...best.slot, address: best.address, doctorName: best.doctorName } : null,
           waiting: !best,
           warnings: buildWarnings(t, best, r, appts),
           notes: r.notes,
         });
       }
+      if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
       const report = { id: hash({ list: state.list, at: now() }), items, targetsHash: gateFingerprint(state.list) };
       state.lastReport = report;
       return report;
@@ -1039,7 +1207,7 @@
 
     async function start() {
       if (state.confirmed !== gateFingerprint(state.list)) throw new Error('сначала холостой прогон и подтверждение');
-      runId++;
+      generation++;
       state.pending = {};
       state.running = true;
       state.lastTickAt = now();
@@ -1053,20 +1221,10 @@
     }
 
     function stop() {
-      runId++;
+      generation++;
       state.running = false;
       state.pending = {};
       timer.cancel();
-    }
-
-    function canContinue(id) {
-      if (!state.running || id !== runId) return false;
-      if (state.confirmed !== gateFingerprint(state.list)) {
-        stop();
-        emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
-        return false;
-      }
-      return true;
     }
 
     function schedule() {
@@ -1076,32 +1234,51 @@
       // minIntervalMs — жёсткий пол ПОСЛЕ джиттера: даже нижняя граница
       // джиттера не должна увести фактическую задержку ниже 30 секунд.
       const jittered = Math.round(base * (0.8 + Math.random() * 0.4));
-      const id = runId;
+      const run = generation;
       timer.schedule(Math.max(config.minIntervalMs, jittered), () => {
-        if (canContinue(id)) return tick();
+        if (run === generation) return tick();
       });
     }
 
-    // Три исхода targets.act(): успех (ok && verified) — цель выполнена;
-    // «не смогли проверить» (ok && !verified, включая явный verifyFailed) —
-    // мутация могла пройти, но подтвердить не удалось: цель НЕ помечаем
-    // выполненной и на этом же слоте не повторяемся прямо на следующем
-    // тике; отказ (!ok) — смотрим action.
-    async function finish(t, cand, id) {
-      const cancelled = { ok: false, verified: false, cancelled: true, message: 'поиск остановлен или изменён' };
-      if (!canContinue(id)) return cancelled;
+    async function finish(t, cand, run, expiresAt = Infinity) {
+      if (booking || !isCurrent(run)) return aborted();
+      booking = finishBooking(t, cand, run, expiresAt);
+      try {
+        return await booking;
+      } finally {
+        booking = null;
+      }
+    }
+
+    async function finishBooking(t, cand, run, expiresAt) {
+      const canSend = () => isCurrent(run) && now() < expiresAt && now() >= api.backoffUntil();
+      if (!canSend()) return aborted();
+      const scope = session.assertContext?.();
+      const canVerify = () => {
+        try { session.assertContext?.(scope); return true; }
+        catch (e) { return false; }
+      };
       const appts = await appointments();
-      if (!canContinue(id)) return cancelled;
-      // Уже отправленную запись нельзя отменить остановкой таймера:
-      // её результат всё равно проверяем и сообщаем человеку.
-      const res = await targets.act(t, cand, { now: now(), appointments: appts, canContinue: () => canContinue(id) });
-      if (res.cancelled) return cancelled;
+      if (!canSend()) return aborted();
+      if (existingAppointment(t, appts)) {
+        adoptExisting(t, appts);
+        return { ok: false, message: 'По этому направлению уже есть запись. Проверьте её в ЕМИАС.' };
+      }
+      const ctx = { now: now(), appointments: appts, canSend, canVerify };
+      const res = targets.validateCandidate?.(t, cand, ctx) || await targets.act(t, cand, ctx);
+      if (res.aborted) return aborted();
+      if (!isCurrent(run)) {
+        // Проверяем уже отправленный запрос в прежней сессии. Его результат
+        // не должен менять состояние нового запуска.
+        if (res.ok && res.verified && canVerify()) emit('booked', { afterStop: true });
+        return aborted();
+      }
 
       if (res.ok && res.verified) {
         state.byId[t.id] = { state: t.keepImproving ? 'improving' : 'done', note: res.message };
-        delete state.verifyFailedKey[t.id];
         if (t.keepImproving && res.newAppointment) {
-          t.current = res.newAppointment.startTime + '+03:00';
+          const start = res.newAppointment.startTime;
+          t.current = /(?:Z|[+-]\d\d:?\d\d)$/.test(start) ? start : start + '+03:00';
           const wasBookDoctor = t.scenario === 'bookDoctor';
           t.source = { ...t.source, appointmentId: res.newAppointment.id, moId: res.newAppointment.lpuId || t.source.moId };
           if (wasBookDoctor) {
@@ -1112,6 +1289,8 @@
             t.source = {
               ...t.source, lpuId: res.newAppointment.lpuId || t.source.lpuId,
               specialityName: (res.newAppointment.toDoctor && res.newAppointment.toDoctor.specialityName) || t.title,
+              availableResourceId: res.newAppointment.toDoctor?.availableResourceId ?? res.newAppointment.availableResourceId ?? cand.resourceId,
+              doctorName: res.newAppointment.toDoctor?.doctorFio || cand.doctorName || null,
             };
             t.scenario = 'shiftDoctor';
           } else if (t.scenario === 'bookLab') {
@@ -1122,28 +1301,20 @@
             t.scenario = 'shiftLdp';
           }
         }
-        // C1: current/source/scenario идут в событие как есть ПОСЛЕ возможной мутации
-        // выше — раннер меняет их только у себя в памяти (state.list), а обвязка
-        // (userscript) хранит цели отдельно в localStorage (cfg.targets). Без этих
-        // полей в payload обвязка не может обновить сохранённую цель и после
-        // перезагрузки/захвата другой вкладкой стартует по УСТАРЕВШИМ current/source —
-        // gateFingerprint намеренно не замечает эту рассинхронизацию (см. выше), так что
-        // дыру не поймать ни один гейт, только сама доставка актуальных полей.
+        // Интерфейс показывает обновлённую цель после переноса.
         emit('booked', {
           targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, message: res.message,
           current: t.current, source: t.source, scenario: t.scenario,
         });
+        if (!t.keepImproving) emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
         return res;
       }
 
       if (res.ok && !res.verified) {
-        // Не смогли подтвердить результат (verifyFailed или явное «готово,
-        // но в списке не вижу») — не трогаем состояние цели и запоминаем
-        // слот на VERIFY_FAILED_TTL_MS, чтобы не попытаться записаться на
-        // него же ещё раз почти сразу; после истечения срока (или если
-        // появится другой кандидат) попытка на этом слоте снова разрешена.
-        state.verifyFailedKey[t.id] = { key: candidateKey(cand), expiresAt: now() + VERIFY_FAILED_TTL_MS };
-        emit('found', { targetId: t.id, warning: res.message, slot: cand.slot, address: cand.address });
+        const message = 'Результат не подтверждён. Цель остановлена. Проверьте приём в ЕМИАС.';
+        state.byId[t.id] = { state: 'stopped', note: message };
+        emit('found', { targetId: t.id, warning: message, slot: cand.slot, address: cand.address });
+        emit('targetDone', { targetId: t.id, title: t.title, message });
         return res;
       }
 
@@ -1152,7 +1323,7 @@
         state.byId[t.id] = { state: 'stopped', note: res.message };
         emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
       } else if (res.action === 'relogin') {
-        emit('sessionLost', { message: res.message });
+        loseSession(res.message);
         return res;
       }
       // 'wait' | 'switchToShift' | 'retry' | null — обычный повтор на
@@ -1164,22 +1335,47 @@
     // Ответ пользователя на needConfirm (режим mode: 'confirm'). Раннер
     // может быть уже остановлен между needConfirm и ответом человека (или
     // намеренно, или из-за stop()) — в этом случае ничего в ЕМИАС не шлём,
-    // старые заявки снимаются при stop(), чтобы не пережить перезапуск.
-    async function answer(targetId, decision) {
+    // заявка остаётся нетронутой на случай последующего запуска.
+    async function answer(targetId, decision, offerId) {
       if (!state.running) return { ok: false, message: 'раннер остановлен, ответ не отправлен' };
       const p = state.pending[targetId];
+      if (!p || (offerId != null && offerId !== p.offerId)) return aborted();
       delete state.pending[targetId];
-      if (!p) return { ok: false, message: 'решение уже не актуально' };
+      if (now() >= p.expiresAt) return aborted();
       if (decision !== 'book') {
         log(`${p.target.title}: пользователь отклонил слот`);
         return { ok: false };
       }
-      return finish(p.target, p.candidate, runId);
+      const run = generation;
+      try { return await finish(p.target, p.candidate, run, p.expiresAt); }
+      catch (e) {
+        if (!isCurrent(run)) return aborted();
+        if (e?.name === 'SessionError') loseSession(e.message);
+        throw e;
+      }
+    }
+
+    function loseSession(message) {
+      stop();
+      session.clear?.();
+      emit('sessionLost', { message });
     }
 
     async function tick() {
-      const id = runId;
-      if (!canContinue(id)) return;
+      if (!state.running) return;
+
+      // C2: гейт холостого прогона проверяем не только в start(), но и на
+      // каждом тике — setTargets() может прийти уже во время работающего
+      // цикла (мастер меняет условия, пока человек ещё читает холостой
+      // прогон), и цикл не должен продолжать работать по неподтверждённым
+      // целям до следующего запланированного tick().
+      if (state.confirmed !== gateFingerprint(state.list)) {
+        stop();
+        emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
+        return;
+      }
+      const run = generation;
+      const active = () => isCurrent(run);
 
       // Обнаружение сна компьютера/вкладки: если между тиками прошло сильно
       // больше, чем должно быть по расписанию, — это не «мы решили не
@@ -1192,29 +1388,26 @@
       state.lastCheckAt = now();
 
       try {
-        if (session.needsRefresh(config.refreshAt)) await session.refresh();
-        if (!canContinue(id)) return;
+        session.assertContext?.();
         if (now() >= api.backoffUntil()) {
           const appts = await appointments();
-          if (!canContinue(id)) return;
-          // I4: потеря сессии не должна засчитываться как успешная проверка —
-          // оба break targetsLoop ниже взводят этот флаг, и lastOkAt/
-          // staleNotified обновляются только если сессия жива.
-          let relogin = false;
+          if (!active()) return;
+          // Ошибки запросов расписания не засчитываем как успешную проверку.
+          let searchOk = true;
           targetsLoop:
           for (const t of state.list) {
-            if (!canContinue(id)) return;
             // C2: backoffUntil проверяли только один раз в начале tick() (выше) — но
             // targets.search() сам может нарваться на 429 ПОСЕРЕДИНЕ этого перебора
             // (например, у первой цели), и тогда без этой проверки раннер всё равно
             // продолжил бы дёргать ЕМИАС по остальным целям в том же тике.
-            if (now() < api.backoffUntil()) break targetsLoop;
+            if (!active()) return;
+            if (now() < api.backoffUntil()) { searchOk = false; break targetsLoop; }
             const st = state.byId[t.id];
             // 'improving' — цель уже выполнена один раз, но keepImproving
             // просит продолжать искать более удобный слот, поэтому такую
             // цель не пропускаем, в отличие от 'done' и 'stopped'.
             if (st.state === 'done' || st.state === 'stopped') continue;
-            if (state.pending[t.id]) continue; // ждём решения пользователя
+            if (state.pending[t.id] || booking) continue;
 
             // Запись по направлению могла появиться во время работы (в том
             // числе руками на сайте) — тогда переходим в перенос, а не ищем
@@ -1231,9 +1424,9 @@
               continue;
             }
 
-            if (!canContinue(id)) return;
-            const r = await targets.search(t, { now: now(), appointments: appts });
-            if (!canContinue(id)) return;
+            const r = await targets.search(t, { now: now(), appointments: appts, active });
+            if (!active()) return;
+            if (r.action === 'wait' || r.action === 'retry') searchOk = false;
 
             if (r.action === 'stopTarget') {
               const message = (r.notes && r.notes.join('; ')) || 'цель остановлена';
@@ -1246,9 +1439,8 @@
               continue;
             }
             if (r.action === 'relogin') {
-              relogin = true;
-              emit('sessionLost', { message: (r.notes && r.notes.join('; ')) || 'потеряна сессия' });
-              break targetsLoop; // сессия недействительна для всех целей сразу
+              loseSession((r.notes && r.notes.join('; ')) || 'Вход в ЕМИАС закончился.');
+              return;
             }
 
             if (!r.candidates.length) {
@@ -1257,38 +1449,29 @@
             }
 
             const cand = r.candidates[0];
-            const key = candidateKey(cand);
-            const vf = state.verifyFailedKey[t.id];
-            if (vf) {
-              if (now() < vf.expiresAt && vf.key === key) {
-                log(`${t.title}: пропускаю тот же слот после неудачной проверки, попробую другой на следующем тике`);
-                continue;
-              }
-              // Либо срок истёк, либо появился другой кандидат — метка не актуальна.
-              delete state.verifyFailedKey[t.id];
-            }
-
             if (t.mode === 'confirm') {
               const expiresAt = now() + 60000;
-              state.pending[t.id] = { target: t, candidate: cand, expiresAt };
-              emit('needConfirm', { targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, expiresAt });
+              const offerId = ++offerSequence;
+              state.pending[t.id] = { target: t, candidate: cand, expiresAt, offerId };
+              emit('needConfirm', {
+                targetId: t.id, title: t.title, slot: cand.slot, address: cand.address,
+                doctorName: cand.doctorName, expiresAt, offerId,
+              });
               continue;
             }
 
-            const res = await finish(t, cand, id);
-            if (!canContinue(id)) return;
-            if (res.action === 'relogin') { relogin = true; break targetsLoop; }
+            const res = await finish(t, cand, run);
+            if (!active() || res.action === 'relogin') return;
           }
-          if (!canContinue(id)) return;
-          if (!relogin) {
+          if (searchOk && now() >= api.backoffUntil()) {
             state.lastOkAt = now();
             state.staleNotified = false;
           }
         }
       } catch (e) {
-        if (!canContinue(id)) return;
-        if (e && e.name === 'SessionError') emit('sessionLost', { message: e.message });
-        else log('сбой проверки: ' + (e && e.message));
+        if (!active()) return;
+        if (e?.name === 'SessionError') { loseSession(e.message); return; }
+        log('Не удалось завершить проверку. Повторю поиск.');
       }
 
       // Протухание: считаем от старта/последней удавшейся проверки. Как
@@ -1309,6 +1492,7 @@
     function status() {
       return {
         running: state.running,
+        booking: Boolean(booking),
         confirmed: state.confirmed === gateFingerprint(state.list),
         lastTickAt: state.lastTickAt,
         lastCheckAt: state.lastCheckAt,
@@ -1331,7 +1515,7 @@
       return () => { state.leadershipHandlers = state.leadershipHandlers.filter((f) => f !== fn); };
     }
 
-    return { setTargets, dryRun, confirmDryRun, start, stop, tick, answer, status, onLeadership };
+    return { setTargets, dryRun, confirmDryRun, start, stop, tick, answer, status, onLeadership, inFlightBooking: () => booking };
   }
 
   const api = { createRunner };
@@ -1455,8 +1639,9 @@
     const util = M.createUtil();
     const errors = M.createErrors();
     const filters = M.createFilters(util);
-    const session = M.createSession({ storage, fetch, now });
-    const api = M.createApi({ session, errors, fetch, now });
+    const timedFetch = M.createTimedFetch(fetch, config.requestTimeoutMs);
+    const session = M.createSession({ storage, fetch: timedFetch, now });
+    const api = M.createApi({ session, errors, fetch: timedFetch, now });
     const discover = M.createDiscover({ api, today: () => util.mskDate(new Date(now())) });
     const targets = M.createTargets({ api, filters, util });
 
@@ -1469,7 +1654,7 @@
       for (const fn of listeners['*'] || []) fn({ type, payload });
     };
 
-    const safeConfig = { slowMs: 30000, minIntervalMs: 30000, refreshAt: 0.6, sleepFactor: 3, staleFactor: 3, ...config };
+    const safeConfig = { slowMs: MIN_INTERVAL_MS, minIntervalMs: MIN_INTERVAL_MS, sleepFactor: 3, staleFactor: 3, ...config };
     // Жёсткий пол применяем уже ПОСЛЕ разворачивания пользовательского config —
     // runner.js берёт Math.max(minIntervalMs, slowMs), поэтому если оба поля
     // занижены одновременно, пол внутри runner.js не спасёт.
@@ -1509,9 +1694,7 @@
     // сообщению ни на что, кроме отметки времени у чужих вкладок, влиять не
     // положено (обработчик claim ниже не меняется). leaderSeenAtTs — время
     // последнего чужого alive ИЛИ claim; без channel координации нет вовсе,
-    // и leaderSeenAt() всегда отдаёт 0. Используется в userscript/ui-dom.js:
-    // standby-вкладка запускает дорогой startFromSavedConfig() только если
-    // давно ничего не слышала от лидера, а не раз в минуту вслепую.
+    // и leaderSeenAt() всегда отдаёт 0.
     let leaderSeenAtTs = 0;
     function sendAlive() {
       // Раннер мог остановиться сам (например, needDryRun на тике) в обход
@@ -1543,77 +1726,44 @@
       };
     }
 
-    // Настоящий idToken ЕМИАС даты рождения не содержит (проверено на живой
-    // вкладке 2026-09-24: поля jti, exp, ua_ver, trusted, iat, sub, aud, amr,
-    // sid, iss, ua_id, FirstName — birthdate/birth_date среди них нет).
-    // Полис при этом в хранилище есть (persist:persist.persistOmsNumber).
-    // Сам сайт берёт дату рождения из ответа GET /api-eip/v2/policy/list —
-    // если её не нашлось в idToken, спрашиваем тот же список и берём дату из
-    // полиса, чей omsNumber совпал с persistOmsNumber (в ответе может быть
-    // несколько полисов, например старый и текущий). Дату рождения нигде не
-    // сохраняем — она живёт только в session.identity() (в памяти), как и
-    // раньше для явно введённой.
+    // Дата относится к владельцу выбранного полиса. В одном входе могут
+    // быть полисы разных пациентов.
     async function birthFromPolicyList(oms) {
       if (!oms) return null; // сверять не с чем — не обращаемся вообще
       const r = await api.get('v2/policy/list');
       if (!r.ok || !r.json) return null;
-      const policies = (r.json.payload && r.json.payload.policies) || [];
-      const mine = policies.find((p) => p && p.omsNumber === oms);
+      const policies = r.json.payload?.policies;
+      if (!Array.isArray(policies)) return null;
+      const mine = policies.find((p) => p?.omsNumber != null && String(p.omsNumber) === String(oms));
       return (mine && String(mine.birthDate || '').slice(0, 10)) || null;
     }
 
-    // Полис и дату рождения предпочтительно передают явно (opts.identity) —
-    // например, их вводит пользователь в интерфейсе. Если их нет, пробуем
-    // угадать из хранилища сайта, а если даты там нет — из policy/list; любая
-    // ошибка разбора здесь не должна валить init() — просто вернём null и
-    // вызывающий код попросит ввести их. Ошибка сессии (SessionError из
-    // api.get) наоборот НЕ гасится — это не «не нашли данные», а настоящая
-    // потеря входа, и она должна дойти до вызывающего кода как есть.
-    async function identityFromStorage() {
-      let oms = null;
-      try { oms = JSON.parse(JSON.parse(storage.getItem('persist:persist')).persistOmsNumber); } catch (e) { oms = null; }
-      let birth = null;
-      try {
-        const t = JSON.parse(JSON.parse(storage.getItem('persist:sessionAuth')).idToken);
-        const payload = JSON.parse(decodeURIComponent(escape(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')))));
-        birth = (payload.birthdate || payload.birth_date || '').slice(0, 10) || null;
-      } catch (e) { birth = null; }
-      if (!birth) birth = await birthFromPolicyList(oms);
-      return { oms, birth };
-    }
-
-    // Залогинен ли сам сайт. После выхода ЕМИАС стирает токены и полис, но
-    // наша копия токенов (emiasSlotHunter:auth) остаётся и session.read() её
-    // принимает — без этой проверки человек видел бы «не нашла полис» вместо
-    // «войдите».
-    function siteLoggedIn() {
-      try { return !!JSON.parse(JSON.parse(storage.getItem('persist:sessionAuth')).accessToken); } catch (e) { return false; }
-    }
-
     async function init(opts = {}) {
-      // Бросает понятную ошибку, если входа в ЕМИАС нет вовсе — не глотаем.
-      session.read();
-      if (!opts.identity && !siteLoggedIn()) throw new Error('нет входа в ЕМИАС: войдите на сайте и попробуйте снова');
-      const id = opts.identity || await identityFromStorage();
-      if (!id.oms || !id.birth) {
+      const scope = session.read();
+      const id = opts.identity || { oms: scope.policy, birth: await birthFromPolicyList(scope.policy) };
+      if (!id.oms || !/^\d{4}-\d{2}-\d{2}$/.test(id.birth)) {
         throw new IdentityError('не удалось определить полис и дату рождения — откройте раздел «Записи» на сайте и попробуйте снова');
       }
-      session.setIdentity(id);
+      session.setIdentity(id, scope);
       return { ok: true };
     }
 
-    // Список целей нормализуем перед передачей раннеру: keepImproving по
-    // умолчанию включён (искать более удобный слот и после первой удачной
-    // записи/переноса), кроме bookReferral — этот сценарий в v0.1 не
-    // поддержан целиком (см. targets.js), «улучшать» там нечего. Явное
-    // keepImproving: false в цели отключает поведение.
     function normalizeTarget(t) {
-      return { ...t, keepImproving: t.keepImproving !== false && t.scenario !== 'bookReferral' };
+      return { ...t, keepImproving: t.keepImproving === true && !t.anyTime && t.scenario !== 'bookReferral' };
     }
 
     return {
       init,
+      checkSession: () => session.assertContext(),
+      clearSession: (finishInFlight = false) => {
+        runner.stop();
+        stopAlive();
+        const pending = finishInFlight ? runner.inFlightBooking() : null;
+        if (pending) session.clearAfter(pending);
+        else session.clear();
+      },
       discover: () => discover.list(),
+      listDoctors: (option) => targets.listDoctors(option),
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),
@@ -1630,7 +1780,7 @@
         return { ok: true };
       },
       stop: () => { stopAlive(); return runner.stop(); },
-      answer: (targetId, decision) => runner.answer(targetId, decision),
+      answer: (targetId, decision, offerId) => runner.answer(targetId, decision, offerId),
       status: () => runner.status(),
       leaderSeenAt: () => leaderSeenAtTs,
       on: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
@@ -1690,9 +1840,14 @@
       // Искать за пределами срока действия направления бессмысленно — если человек
       // задал dateTo позже deadline (или deadline вообще не знал), обрезаем по deadline.
       const dateTo = !form.dateTo ? null : (deadline && deadline < form.dateTo ? deadline : form.dateTo);
+      const sameDoctor = option.scenario === 'shiftDoctor' && form.sameDoctor === true;
+      const source = sameDoctor && !option.source.availableResourceId && form.doctor
+        ? { ...option.source, availableResourceId: form.doctor.id, doctorName: form.doctor.name }
+        : option.source;
 
       return {
-        id: option.id, scenario: option.scenario, title: option.title, source: option.source,
+        id: option.id, scenario: option.scenario, title: option.title, source,
+        sameDoctor,
         current: option.current || null,
         onlyDay,
         anyTime,
@@ -1708,8 +1863,8 @@
         respectTravel: form.respectTravel !== false,
         travelMs: 60 * 60000,
         minLeadMs: 2 * 60 * 60000,
-        keepImproving: option.scenario !== 'bookReferral',
-        mode: form.mode === 'confirm' ? 'confirm' : 'auto',
+        keepImproving: form.keepImproving === true && !anyTime && option.scenario !== 'bookReferral',
+        mode: form.mode === 'auto' ? 'auto' : 'confirm',
         purpose: (option.source && option.source.needPurpose) ? (() => {
           const chosen = INQUIRY_PURPOSES[form.purpose === 'documents' ? 'documents' : 'unwell'];
           return { inquiryPurposeId: chosen.inquiryPurposeId, inquiryPurposeCode: chosen.inquiryPurposeCode };
@@ -1744,6 +1899,10 @@
 
       if (t.timeFrom || t.timeTo) parts.push(`время с ${t.timeFrom || '00:00'} до ${t.timeTo || '23:59'}`);
       if (t.addressContains) parts.push(`адрес: ${t.addressContains}`);
+      if (t.scenario === 'shiftDoctor') {
+        const doctor = t.source?.doctorName || 'врач из текущей записи';
+        parts.push(t.sameDoctor ? `только ${doctor}` : 'любой врач из предложенных ЕМИАС');
+      }
       if (t.prefer) {
         let preferText = `сначала предпочитаю до ${dayHuman(t.prefer.until)}`;
         if (t.prefer.timeTo) preferText += `, до ${t.prefer.timeTo}`;
@@ -1752,6 +1911,7 @@
       if (t.purpose) parts.push(`цель визита: ${purposeTitle(t.purpose)}`);
       if (t.respectTravel) parts.push('с запасом на дорогу');
       parts.push(t.mode === 'confirm' ? 'спрашиваю перед записью' : 'записываю сразу');
+      parts.push(t.keepImproving ? 'продолжаю искать после успеха' : 'останавливаюсь после первого успеха');
 
       // bookDoctor и bookLdp — запись по направлению без текущей записи, для неё
       // отдельная формулировка «Запишу к <специальность> / на <исследование> по
@@ -1768,7 +1928,7 @@
     function describeDryRunItem(item) {
       const head = item.waiting
         ? `${item.title}: подходящих слотов сейчас нет, жду`
-        : `${item.title}: взяла бы ${human(item.would.startTime)} — ${item.would.address}`;
+        : item.would ? [`${item.title}: взяла бы ${human(item.would.startTime)}`, item.would.doctorName, item.would.address].filter(Boolean).join(' — ') : item.title;
       const warn = (item.warnings || []).map((w) => `\n  ⚠ ${w}`).join('');
       const notes = (item.notes || []).map((n) => `\n  · ${n}`).join('');
       return head + warn + notes;
@@ -1777,19 +1937,7 @@
     const saveConfig = (storage, cfg) => storage.setItem(KEY, JSON.stringify(cfg));
     const loadConfig = (storage) => { try { return JSON.parse(storage.getItem(KEY)) || null; } catch (e) { return null; } };
 
-    // C1: чистая функция слияния события 'booked' в сохранённые настройки —
-    // без неё после успешного переноса keepImproving current/source/scenario
-    // менялись только в памяти раннера (core/runner.js), а cfg.targets в
-    // localStorage оставался со СТАРЫМИ значениями. На перезагрузке страницы,
-    // при захвате лидерства standby-вкладкой или по кнопке «Продолжить в этой
-    // вкладке» (startFromSavedConfig) ядро стартовало заново именно по
-    // cfg.targets — и filters.pickSlots могло принять слот ХУЖЕ уже сделанного
-    // переноса, но раньше устаревшего t.current, отправив запись НАЗАД.
-    // confirmedFor намеренно не трогаем — это отпечаток целей ДО мутации (см.
-    // gateFingerprint в core/runner.js), он и должен остаться прежним, иначе
-    // обвязка ложно решила бы, что нужен новый холостой прогон.
-    // Возвращает тот же объект cfg (по ссылке), если сохранять нечего —
-    // вызывающий код (onBooked) по этому признаку решает, нужен ли saveConfig.
+    // Интерфейс хранит отдельный снимок целей для панели состояния.
     function applyBookedUpdate(cfg, payload) {
       if (!cfg || !Array.isArray(cfg.targets) || !payload || payload.targetId == null) return cfg;
       let changed = false;
@@ -1814,7 +1962,7 @@
 
 /* ---- userscript/ui-dom.js ---- */
 // userscript/ui-dom.js — видимый интерфейс: значок, мастер настройки из 4
-// экранов и возобновление поиска после перезагрузки страницы. Единственный
+// экранов. Единственный
 // самозапускающийся модуль — все остальные части ядра только складывают
 // себя в globalThis.EmiasCore, а этот файл их использует и рисует DOM.
 //
@@ -1831,7 +1979,12 @@
 
   const { create, createUiState } = globalThis.EmiasCore;
   const ui = createUiState();
-  const storage = window.localStorage;
+  const siteStorage = window.localStorage;
+  const settings = new Map();
+  const storage = {
+    getItem: (key) => settings.get(key) ?? null,
+    setItem: (key, value) => settings.set(key, value),
+  };
 
   /* ==================== состояние мастера (переменная модуля) ==================== */
   // Ничего отсюда не пишется в хранилище раньше шага 3 — см. requirements.
@@ -1859,18 +2012,10 @@
   // видит, если не следить за ними отдельно (см. ниже).
   const failedConfirmNodes = [];
   let statusRefreshId = null;
-  let recoveryWatchId = null;
-  let standbyRetryId = null;
   let finishedAll = false; // все цели завершились сами — поиск остановлен
   let preBookedBadge = null; // значок до последнего «Записано», чтобы вернуть текст, а не только цвет
-  // C-1: отпечаток подтверждённых целей, по которым работает ЭТА вкладка.
-  // Работающая вкладка сверяет его с настройками (startStatusRefresh) —
-  // если другая вкладка перенастроила или остановила поиск, эта уступает.
-  let runningFor = null;
-  // I-1: номер попытки запуска по сохранённым настройкам. «Остановить»,
-  // открытие мастера и новая попытка увеличивают его — старая попытка,
-  // дождавшись холостого прогона, видит, что устарела, и не стартует.
-  let startAttempt = 0;
+  let wizardLoading = false;
+  let wizardGeneration = 0;
   // I-3: временное пояснение к зелёному значку (например, «записать не
   // удалось»), чтобы обновление раз в 5 секунд не стирало его сразу.
   let badgeNote = null; // { text, until }
@@ -2095,117 +2240,36 @@
   function onBadgeClick() {
     if (panelMode) { hidePanel(); return; }
     const kind = badgeState.kind;
-    // C2 п.2: sessionLost/stale — мастер не открываем, только объяснение и
-    // кнопка «Остановить поиск» (сама работа тем временем продолжается сама
-    // по себе и восстановится молча через startRecoveryWatch()).
-    if (kind === 'sessionLost' || kind === 'stale') { openRecoveryPanel(); return; }
-    if (kind === 'needLogin' || kind === 'needIdentity') { retryLogin(); return; }
-    if (kind === 'resumeError') { resumeIfEnabled(); return; }
-    if (kind === 'standby') { openStandbyPanel(); return; }
     if (kind === 'booked') { acknowledgeBooked(); openStatusPanel(); return; }
-    if (kind === 'running' || kind === 'resuming') { openStatusPanel(); return; }
-    // needDryRun и любой прочий случай — безопаснее всего начать настройку заново.
-    openWizardGuarded(1);
+    if (kind === 'running' || kind === 'stale' || kind === 'finished') { openStatusPanel(); return; }
+    if (kind === 'standby') { openStandbyPanel(); return; }
+    prepareWizard();
   }
 
-  // C2 п.2: открытие мастера, когда ядро всё ещё работает по старым целям
-  // (например, кликнули «Настроить» мимо статус-панели), сначала
-  // останавливает цикл — иначе setTargets() на шаге 3 обнулит подтверждение
-  // прямо во время работающего поиска.
-  //
-  // C-1 п.2: заодно помечаем паузу в настройках — вкладки в standby не
-  // должны подхватывать поиск по старым целям, пока здесь меняют условия, а
-  // работающая вкладка (если поиск шёл не здесь) по этой метке уступает.
-  // Пауза снимается в onStart после нового подтверждения.
-  function openWizardGuarded(step) {
-    startAttempt++; // незаконченная попытка возобновления больше не стартует (I-1)
-    stopRecoveryWatch(); // M-2
-    if (core.status().running) {
-      core.stop();
-      runningFor = null;
-      stopStatusRefresh();
-      clearAllConfirmCards();
-      setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'нужен новый холостой прогон' });
+  async function prepareWizard() {
+    if (wizardLoading) return;
+    resetSearch();
+    wizardLoading = true;
+    const generation = ++wizardGeneration;
+    try {
+      await core.init();
+      if (generation === wizardGeneration) openWizard(1);
+    } catch (e) {
+      if (generation === wizardGeneration) setBadge(initErrorBadge(e));
+    } finally {
+      wizardLoading = false;
     }
-    // Настройка идёт в этой вкладке — повтор standby не должен подменять
-    // цели мастера в ядре и стартовать сам.
-    if (standbyRetryId) { clearInterval(standbyRetryId); standbyRetryId = null; }
-    if (badgeState.kind === 'standby') setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'идёт настройка' });
-    const cfg = ui.loadConfig(storage);
-    if (cfg && cfg.enabled && !cfg.paused) ui.saveConfig(storage, { ...cfg, paused: true, pausedAt: Date.now() });
-    openWizard(step);
   }
 
   function showPanel() { dom.panel.hidden = false; }
   function hidePanel() { dom.panel.hidden = true; panelMode = null; wizard.open = false; }
 
-  /* ==================== панель объяснения при sessionLost/stale ==================== */
-  function openRecoveryPanel() { panelMode = 'recovery'; showPanel(); renderRecoveryPanel(); }
-
-  function renderRecoveryPanel() {
+  function openStandbyPanel() {
+    panelMode = 'standby';
+    showPanel();
     clear(dom.panel);
-    const isStale = badgeState.kind === 'stale';
-    dom.panel.appendChild(h('h3', { text: isStale ? 'Давно нет ответа от ЕМИАС' : 'Нужно войти в ЕМИАС' }));
-    dom.panel.appendChild(h('p', { text: 'Войдите в ЕМИАС в соседней вкладке — поиск продолжится сам, ничего перезапускать не нужно.' }));
-    if (badgeState.detail) dom.panel.appendChild(h('p', { class: 'esh-note', text: badgeState.detail }));
-    dom.panel.appendChild(h('div', { class: 'esh-btns' }, [
-      h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop }),
-    ]));
-  }
-
-  /* ==================== панель standby (эта вкладка уступила другой) ==================== */
-  function openStandbyPanel() { panelMode = 'standby'; showPanel(); renderStandbyPanel(); }
-
-  function renderStandbyPanel(note) {
-    clear(dom.panel);
-    const cfg = ui.loadConfig(storage);
-    const paused = !!(cfg && cfg.paused);
-    dom.panel.appendChild(h('h3', { text: paused ? 'Условия поиска меняют в другой вкладке' : 'Поиск идёт в другой вкладке' }));
-    // C3: в этой вкладке остановить поиск нельзя — он не здесь работает, и
-    // «Остановить поиск» тут не должно ни к чему предлагать, ни менять
-    // enabled в настройках.
-    dom.panel.appendChild(h('p', {
-      text: paused
-        ? 'Когда там нажмут «Запустить охоту», поиск продолжится по новым условиям. Можно и настроить поиск здесь заново.'
-        : 'Чтобы остановить поиск, сделайте это в той вкладке ЕМИАС, где он сейчас работает.',
-    }));
-    if (note) dom.panel.appendChild(h('p', { class: 'esh-warn', text: note }));
-    dom.panel.appendChild(h('div', { class: 'esh-btns' }, [
-      paused
-        ? h('button', { class: 'esh-btn primary', text: 'Настроить здесь', onclick: () => openWizardGuarded(1) })
-        : h('button', { class: 'esh-btn primary', text: 'Продолжить в этой вкладке', onclick: onContinueHere }),
-    ]));
-  }
-
-  // I11: по клику пробуем перехватить лидерство прямо сейчас — ядро само
-  // решит спор вкладок (у чьего claim id больше).
-  // C-1 п.1: стартуем только по свежим настройкам и только после нового
-  // холостого прогона, совпавшего с подтверждённым (тот же путь, что и
-  // resumeIfEnabled) — цели из памяти вкладки могли устареть.
-  async function onContinueHere() {
-    clear(dom.panel);
-    dom.panel.appendChild(h('h3', { text: 'Поиск идёт в другой вкладке' }));
-    dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Проверяю условия поиска, подождите…' }));
-    let r;
-    try {
-      r = await startFromSavedConfig();
-    } catch (e) {
-      if (panelMode === 'standby') renderStandbyPanel('Не удалось проверить: ' + ((e && e.message) || 'нет ответа от ЕМИАС'));
-      return;
-    }
-    if (r.status === 'started') {
-      if (!showBookedBadge()) setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-      startStatusRefresh();
-      if (standbyRetryId) { clearInterval(standbyRetryId); standbyRetryId = null; }
-      hidePanel();
-    } else if (r.status === 'mismatch') {
-      showReconfirm(r.cfg, r.report);
-    } else if (r.status === 'off') {
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-      hidePanel();
-    } else if (panelMode === 'standby') {
-      renderStandbyPanel();
-    }
+    dom.panel.appendChild(h('p', { text: 'Поиск идёт в другой вкладке. Остановите его там перед запуском здесь.' }));
+    dom.panel.appendChild(h('button', { class: 'esh-btn', text: 'Настроить заново', onclick: () => { hidePanel(); prepareWizard(); } }));
   }
 
   /* ==================== лог событий (для статус-панели) ==================== */
@@ -2255,7 +2319,9 @@
     const logBox = renderLog(logEvents);
     dom.panel.appendChild(logBox);
     logBox.scrollTop = logScrollTop;
-    const stopBtn = h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop });
+    const stopBtn = st.running
+      ? h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop })
+      : h('button', { class: 'esh-btn primary', text: 'Настроить заново', onclick: () => { hidePanel(); prepareWizard(); } });
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [stopBtn]));
   }
 
@@ -2304,12 +2370,16 @@
 
   /* ==================== шаг 1: выбор направлений и записей ==================== */
   async function loadStep1() {
+    const generation = wizardGeneration;
     renderLoading('Шаг 1 из 3. За чем следить');
     try {
       const options = await core.discover();
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 1) return;
       wizard.options = options;
       renderStep1(options);
     } catch (e) {
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 1) return;
+      if (e.name === 'SessionError') { onSessionLost(e); return; }
       renderLoadError('Шаг 1 из 3. За чем следить', e && e.message, loadStep1);
     }
   }
@@ -2344,6 +2414,7 @@
 
   function describeOptionMeta(option) {
     const parts = [];
+    if (option.source?.doctorName) parts.push(option.source.doctorName);
     if (option.current) parts.push('сейчас записано на ' + ui.human(option.current));
     if (option.address) parts.push(ui.stripCampus(option.address));
     if (option.deadline) parts.push('направление действует по ' + option.deadline.slice(8, 10) + '.' + option.deadline.slice(5, 7));
@@ -2374,10 +2445,65 @@
         when: 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
         where: option.address ? 'sameCampus' : 'any', addressContains: '',
-        respectTravel: true, mode: 'auto', purpose: 'unwell',
+        respectTravel: true, mode: 'confirm', purpose: 'unwell', keepImproving: false, sameDoctor: false,
       };
     }
     return wizard.forms[option.id];
+  }
+
+  function doctorField(option, form, update) {
+    if (option.scenario !== 'shiftDoctor') return null;
+    const field = h('div', {}, [h('label', { class: 'esh-row' }, [
+      h('input', { type: 'checkbox', checked: form.sameDoctor, onchange: (event) => update({ sameDoctor: event.target.checked }) }),
+      h('span', { text: 'Только тот же врач' }),
+    ])]);
+    if (!form.sameDoctor) return field;
+    const originalName = option.source.doctorName;
+    if (option.source.availableResourceId) {
+      if (originalName) field.appendChild(h('p', { class: 'esh-note', text: originalName }));
+      return field;
+    }
+    const text = originalName ? `Текущий врач: ${originalName}. Выберите его в списке.` : 'Сверьте имя врача в текущей записи ЕМИАС и выберите его в списке.';
+    field.appendChild(h('p', { text }));
+    if (form.doctors) {
+      const items = form.doctors.map((doctor) => h('option', {
+        value: String(doctor.id), text: doctor.ambiguous ? `${doctor.name} (есть совпадения имени)` : doctor.name,
+        disabled: doctor.ambiguous, selected: form.doctor?.id === doctor.id,
+      }));
+      const placeholder = h('option', { value: '', text: 'Выберите врача', selected: !form.doctor });
+      if (items.length) {
+        field.appendChild(h('select', {
+          'aria-label': 'Врач для переноса',
+          onchange: (event) => update({ doctor: form.doctors.find((doctor) => !doctor.ambiguous && String(doctor.id) === event.target.value) }),
+        }, [placeholder, ...items]));
+      } else {
+        field.appendChild(h('p', { class: 'esh-note', text: 'ЕМИАС пока не предлагает врачей для переноса этой записи.' }));
+      }
+    }
+    if (form.doctorListError) field.appendChild(h('p', { class: 'esh-warn', text: form.doctorListError }));
+    if (!form.doctors?.some((doctor) => !doctor.ambiguous)) field.appendChild(h('button', {
+      class: 'esh-btn', disabled: !!form.loadingDoctors,
+      text: form.loadingDoctors ? 'Загружаю список…' : 'Показать список врачей',
+      onclick: () => loadDoctors(option, form, update),
+    }));
+    return field;
+  }
+
+  async function loadDoctors(option, form, update) {
+    if (form.loadingDoctors) return;
+    const generation = wizardGeneration;
+    update({ loadingDoctors: true, doctorListError: '' });
+    const visible = () => generation === wizardGeneration && wizard.open && wizard.step === 2;
+    try {
+      const doctors = await core.listDoctors(option);
+      if (visible()) update({ doctors, loadingDoctors: false });
+    } catch (error) {
+      if (!visible()) return;
+      if (error.name === 'SessionError') { onSessionLost(error); return; }
+      update({ loadingDoctors: false, doctorListError: error.message });
+    } finally {
+      form.loadingDoctors = false;
+    }
   }
 
   // Направление к врачу с needPurpose: true — сайт требует выбрать цель визита
@@ -2414,7 +2540,7 @@
 
   function whereField(option, form, update, quiet) {
     const opts = [
-      ...(option.address ? [['sameCampus', 'в этом же здании']] : []),
+      ...(option.address ? [['sameCampus', 'по этому же адресу (любой корпус)']] : []),
       ['any', 'где угодно'],
       ['contains', 'адрес содержит:'],
     ];
@@ -2454,6 +2580,8 @@
     const quiet = (patch) => { Object.assign(form, patch); refreshStepTwoState(); };
     const card = h('div', { class: 'esh-opt' });
     card.appendChild(h('div', { class: 'title', text: option.title }));
+    const doctor = doctorField(option, form, update);
+    if (doctor) card.appendChild(doctor);
     card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
     card.appendChild(whenField(option, form, update, quiet));
     card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
@@ -2475,6 +2603,12 @@
         h('span', { text: 'сначала спрашивать' }),
       ]),
     ]));
+    if (form.when !== 'onlyDay') {
+      card.appendChild(h('label', { class: 'esh-row' }, [
+        h('input', { type: 'checkbox', checked: form.keepImproving, onchange: (e) => update({ keepImproving: e.target.checked }) }),
+        h('span', { text: 'Продолжать искать более ранний слот после успеха' }),
+      ]));
+    }
     card.appendChild(advancedFields(form, quiet));
     const error = stepTwoError(option, form);
     const errorEl = h('p', { class: 'esh-warn', text: error || '', hidden: !error });
@@ -2484,8 +2618,11 @@
   }
 
   function stepTwoError(option, form) {
+    if (option.scenario === 'shiftDoctor' && form.sameDoctor && !option.source.availableResourceId && !form.doctor) return 'выберите врача для переноса';
     if (form.when === 'onlyDay' && !form.day) return 'выберите день';
     if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
+    if (form.dateFrom && form.dateTo && form.dateFrom > form.dateTo) return 'проверьте порядок дат';
+    if (form.timeFrom && form.timeTo && form.timeFrom > form.timeTo) return 'проверьте порядок времени';
     return null;
   }
 
@@ -2526,14 +2663,19 @@
 
   /* ==================== шаг 3: холостой прогон и запуск ==================== */
   async function loadStep3() {
+    const generation = wizardGeneration;
     renderLoading('Шаг 3 из 3. Проверка перед запуском');
     wizard.builtTargets = wizard.selected.map((o) => ui.buildTarget(o, ensureForm(o)));
     core.setTargets(wizard.builtTargets);
     try {
-      wizard.report = await core.dryRun();
+      const report = await core.dryRun();
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 3) return;
+      wizard.report = report;
       wizard.checked = false;
       renderStep3(wizard.report);
     } catch (e) {
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 3) return;
+      if (e.name === 'SessionError') { onSessionLost(e); return; }
       renderLoadError('Шаг 3 из 3. Проверка перед запуском', e && e.message, loadStep3);
     }
   }
@@ -2554,6 +2696,7 @@
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: 'Шаг 3 из 3. Проверка перед запуском' }));
     dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Это холостой прогон: скрипт проверил расписание и показывает, что сделал бы прямо сейчас. Ничего не записано и не перенесено.' }));
+    dom.panel.appendChild(h('div', {}, (wizard.builtTargets || []).map((t) => h('p', { text: ui.describeTarget(t) }))));
     dom.panel.appendChild(h('div', {}, report.items.map(renderReportItem)));
     const checkbox = h('input', {
       type: 'checkbox', checked: wizard.checked,
@@ -2578,43 +2721,52 @@
     ]));
   }
 
-  async function onStart() {
+  async function onStart(event) {
+    if (!event.isTrusted) return;
+    event.currentTarget.disabled = true;
     // C1: защита от запуска по пустому списку целей (например, если сюда
     // всё же попали с испорченным состоянием мастера) — без неё в настройки
     // тихо сохранился бы targets: [] при зелёном значке.
     if (!wizard.builtTargets || !wizard.builtTargets.length) {
-      renderLoadError('Шаг 3 из 3. Проверка перед запуском', 'Список целей пуст — нечего запускать. Начните заново с шага 1.', () => openWizardGuarded(1));
+      renderLoadError('Шаг 3 из 3. Проверка перед запуском', 'Список целей пуст — нечего запускать. Начните заново с шага 1.', prepareWizard);
       return;
     }
     try {
+      core.checkSession();
       core.confirmDryRun(wizard.report.id);
       await core.start();
-      // C-1 п.2: новое подтверждение снимает паузу (новый объект настроек
-      // без paused/pausedAt).
-      ui.saveConfig(storage, { enabled: true, paused: false, targets: wizard.builtTargets, confirmedFor: wizard.report.targetsHash });
-      runningFor = wizard.report.targetsHash;
+      ui.saveConfig(storage, { targets: wizard.builtTargets });
       // Minor: сразу после старта проверок ещё не было — не выдумываем время
       // последней проверки.
-      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'первая проверка через минуту' });
+      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'ожидаю первую проверку' });
       startStatusRefresh();
       openWizard(4);
     } catch (e) {
+      if (e.name === 'SessionError') { onSessionLost(e); return; }
       renderLoadError('Шаг 3 из 3. Проверка перед запуском', e && e.message, () => renderStep3(wizard.report));
     }
   }
 
-  function onStop() {
-    startAttempt++; // I-1: идущая попытка возобновления после прогона не стартует
-    core.stop();
-    runningFor = null;
+  function resetSearch(finishInFlight = false) {
+    wizardGeneration++;
+    core.clearSession(finishInFlight);
     stopStatusRefresh();
-    stopRecoveryWatch(); // M-2
-    if (standbyRetryId) { clearInterval(standbyRetryId); standbyRetryId = null; }
-    clearAllConfirmCards(); // I6: живые карточки «спросить» после остановки не нужны
-    const cfg = ui.loadConfig(storage) || {};
-    ui.saveConfig(storage, { ...cfg, enabled: false });
-    setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
+    clearAllConfirmCards();
+    settings.clear();
+    logEvents.length = 0;
+    preBookedBadge = null;
+    finishedAll = false;
+    Object.assign(wizard, { options: [], selected: [], forms: {}, report: null, builtTargets: null, checked: false });
     hidePanel();
+  }
+
+  function onStop() {
+    const booking = core.status().booking;
+    resetSearch(true);
+    setBadge({
+      kind: 'idle', text: '🎯 Настроить',
+      detail: booking ? 'Проверьте, успел ли измениться приём в ЕМИАС.' : 'Поиск остановлен',
+    });
   }
 
   /* ==================== запросы на подтверждение слота (mode: confirm) ==================== */
@@ -2631,11 +2783,12 @@
       ? `${p.payload.title}: перенесу с ${ui.human(current)} на ${ui.human(p.payload.slot.startTime)}`
       : `${p.payload.title}: запишу на ${ui.human(p.payload.slot.startTime)}`;
     card.appendChild(h('p', { text: headText }));
-    if (p.payload.address) card.appendChild(h('p', { class: 'esh-note', text: ui.stripCampus(p.payload.address) }));
+    if (p.payload.doctorName) card.appendChild(h('p', { text: p.payload.doctorName }));
+    if (p.payload.address) card.appendChild(h('p', { class: 'esh-note', text: p.payload.address }));
     card.appendChild(h('p', { class: 'esh-note', text: `Осталось ${left} с` }));
     card.appendChild(h('div', { class: 'esh-btns' }, [
-      h('button', { class: 'esh-btn', text: 'Пропустить', onclick: () => answerConfirm(targetId, 'skip') }),
-      h('button', { class: 'esh-btn primary', text: 'Записать', onclick: () => answerConfirm(targetId, 'book') }),
+      h('button', { class: 'esh-btn', text: 'Пропустить', onclick: (e) => { if (e.isTrusted) answerConfirm(targetId, p.payload.offerId, 'skip'); } }),
+      h('button', { class: 'esh-btn primary', text: 'Записать', onclick: (e) => { if (e.isTrusted) answerConfirm(targetId, p.payload.offerId, 'book'); } }),
     ]));
     if (p.node) dom.confirms.replaceChild(card, p.node);
     else dom.confirms.appendChild(card);
@@ -2660,8 +2813,7 @@
   function onNeedConfirm(payload) {
     // I8: окно ответа всего 60 секунд, а вкладка обычно фоновая — без звука
     // и уведомления человек может просто не заметить запрос вовремя.
-    const where = payload.address ? ` — ${ui.stripCampus(payload.address)}` : '';
-    notify('ЕМИАС: нужно решение', `${payload.title}: ${ui.human(payload.slot.startTime)}${where} — 60 секунд на ответ`);
+    notify('ЕМИАС: найден слот', 'Откройте вкладку ЕМИАС. На решение есть 60 секунд.');
     const targetId = payload.targetId;
     removeConfirmCard(targetId);
     const tickId = setInterval(() => {
@@ -2698,19 +2850,19 @@
     node.appendChild(h('p', { class: warn ? 'esh-warn' : 'esh-note', text }));
   }
 
-  async function answerConfirm(targetId, decision) {
+  async function answerConfirm(targetId, offerId, decision) {
+    const p = pendingConfirms[targetId];
+    if (!p || p.busy || p.payload.offerId !== offerId) return;
     const title = titleFor(targetId);
     const bookDecision = decision === 'book';
-    const p = pendingConfirms[targetId];
-    if (!p || p.busy) return;
-    const node = p.node;
-    // Пока ждём ответ, stop()/standby всё ещё могут убрать эту карточку.
+    const node = p && p.node;
+    // Сохраняем карточку в списке, чтобы остановка могла убрать её сразу.
     clearInterval(p.tickId);
     p.busy = true;
     const dropNode = () => { if (node && node.parentNode) node.parentNode.removeChild(node); };
     if (!bookDecision) {
       removeConfirmCard(targetId);
-      try { await core.answer(targetId, 'skip'); } catch (e) { /* пропуск ничего не отправляет */ }
+      try { await core.answer(targetId, 'skip', offerId); } catch (e) { /* пропуск ничего не отправляет */ }
       return;
     }
     if (node) showCardNote(node, `${title}: записываю…`, false);
@@ -2719,8 +2871,8 @@
     let alreadyLogged = false;
     let cancelled = false;
     try {
-      const res = await core.answer(targetId, 'book');
-      cancelled = !!(res && res.cancelled);
+      const res = await core.answer(targetId, 'book', offerId);
+      cancelled = !!res?.aborted;
       if (!cancelled && (!res || !res.ok || !res.verified)) {
         failText = (res && res.message) || 'слот уже не актуален';
         alreadyLogged = (foundCount[targetId] || 0) > foundBefore;
@@ -2731,7 +2883,8 @@
     if (pendingConfirms[targetId] !== p) return;
     delete pendingConfirms[targetId];
     if (cancelled || !failText) { dropNode(); return; }
-    const text = `${title}: записать не удалось — ${failText}`;
+    if (!node?.isConnected || badgeState.kind === 'needLogin') { dropNode(); return; }
+    const text = `${title}: ${failText}`;
     if (!alreadyLogged) pushLog({ at: Date.now(), msg: text });
     if (node) {
       showCardNote(node, text, true);
@@ -2743,7 +2896,7 @@
       }, RESULT_NOTE_MS);
       failedConfirmNodes.push(entry);
     }
-    showBadgeNote('записать не удалось: ' + failText);
+    showBadgeNote(failText);
   }
 
   function showBadgeNote(text) {
@@ -2772,20 +2925,10 @@
     if (badgeNote && Date.now() < badgeNote.until) return badgeNote.text;
     badgeNote = null;
     const t = core.status().lastCheckAt;
-    return t ? 'проверено в ' + hhmm(t) : 'первая проверка через минуту';
+    return t ? 'проверено в ' + hhmm(t) : 'ожидаю первую проверку';
   }
 
   /* ==================== события ядра ==================== */
-  // core.init() двух родов ошибок: настоящее «не вошли на сайте» (кидает
-  // SessionError или обычную ошибку из core/session.js read()) и «вошли, но
-  // не удалось само определить полис/дату рождения» (IdentityError из
-  // core/index.js — идентификатор не нашёлся ни в idToken, ни в
-  // /api-eip/v2/policy/list). Раньше оба случая показывали один и тот же
-  // текст «🔒 Войдите в ЕМИАС» — по клику ядро пробовало снова, падало с той
-  // же IdentityError и человек читал ровно то же самое сообщение по кругу,
-  // хотя вход-то как раз есть. Текст для IdentityError отдельный и говорит,
-  // что реально сделать (полис в хранилище сайта появляется, когда открыт
-  // раздел «Полисы ОМС»).
   function initErrorBadge(e) {
     if (e && e.name === 'IdentityError') {
       return { kind: 'needIdentity', text: '🔒 Не нашла полис и дату рождения', detail: 'Откройте на сайте раздел «Полисы ОМС», дождитесь загрузки и нажмите ещё раз' };
@@ -2793,32 +2936,17 @@
     return { kind: 'needLogin', text: '🔒 Войдите в ЕМИАС', detail: e && e.message };
   }
 
-  // Если в настройках поиск включён и не на паузе, после входа просто
-  // возобновляем его (как при загрузке страницы), а не открываем мастер —
-  // иначе открытие мастера поставило бы на паузу поиск и в других вкладках.
-  function retryLogin() {
-    core.init().then(() => {
-      const cfg = ui.loadConfig(storage);
-      if (cfg && cfg.enabled && !cfg.paused && Array.isArray(cfg.targets) && cfg.targets.length) { resumeIfEnabled(); return; }
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-      openWizardGuarded(1);
-    }).catch((e) => setBadge(initErrorBadge(e)));
-  }
-
   function onBooked(payload) {
-    const where = payload.address ? ` — ${ui.stripCampus(payload.address)}` : '';
-    notify('ЕМИАС: записано', `${payload.title}: ${ui.human(payload.slot.startTime)}${where}`);
+    if (payload.afterStop) {
+      if (badgeState.kind === 'idle' && !wizard.open && !wizardLoading) {
+        setBadge({ detail: 'Ранее отправленный запрос подтверждён. Посмотрите приём в ЕМИАС.' });
+      }
+      return;
+    }
+    notify('ЕМИАС: записано', 'Подробности во вкладке ЕМИАС.');
     pushLog({ at: Date.now(), msg: `Записано: ${payload.title} — ${ui.human(payload.slot.startTime)}` });
-    // C1: раннер меняет current/source/scenario цели (перенос keepImproving)
-    // только у себя в памяти — без этого сохранённые настройки (cfg.targets)
-    // оставались бы со старыми полями, и следующий запуск по ним (перезагрузка
-    // страницы, standby-вкладка, «Продолжить в этой вкладке») мог бы перенести
-    // уже улучшенную запись НАЗАД. confirmedFor не трогаем — applyBookedUpdate
-    // меняет только сами targets.
     const cfg = ui.loadConfig(storage);
     const nextCfg = ui.applyBookedUpdate(cfg, payload);
-    // lastBooked держит оранжевый значок, пока человек его не увидит (клик),
-    // в том числе после перезагрузки страницы.
     if (nextCfg) ui.saveConfig(storage, { ...nextCfg, lastBooked: { title: payload.title, startTime: payload.slot.startTime, address: payload.address || null } });
     // Minor: раньше при возврате из «Записано» цвет менялся обратно, а текст
     // оставался старым («🟠 Записано: …») — запоминаем значок целиком (а не
@@ -2827,9 +2955,7 @@
     if (!showBookedBadge()) setBadge({ kind: 'booked', text: '🟠 Записано: ' + payload.title, detail: '' });
   }
 
-  // Раньше значок «Записано» через 8 секунд сам возвращался к «Ищу слоты», и
-  // если человек не смотрел на экран, о переносе он не узнавал. Теперь значок
-  // остаётся оранжевым, пока по нему не кликнут (и после перезагрузки тоже).
+  // Показываем результат, пока пользователь не откроет панель.
   function showBookedBadge() {
     const cfg = ui.loadConfig(storage);
     const b = cfg && cfg.lastBooked;
@@ -2842,7 +2968,7 @@
     const cfg = ui.loadConfig(storage);
     if (cfg && cfg.lastBooked) { const next = { ...cfg }; delete next.lastBooked; ui.saveConfig(storage, next); }
     if (core.status().running) setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-    else if (finishedAll) setBadge({ kind: 'idle', text: '✅ Готово', detail: 'все цели выполнены' });
+    else if (finishedAll) setBadge({ kind: 'finished', text: 'Поиск завершён', detail: '' });
     else if (preBookedBadge) setBadge(preBookedBadge);
   }
 
@@ -2859,16 +2985,17 @@
 
   function onTargetDone(payload) {
     pushLog({ at: Date.now(), msg: `${payload.title}: ${payload.message}` });
-    const all = core.status().targets || [];
+    const all = core.status().targets;
     if (!all.length || !all.every((t) => t.state === 'done' || t.state === 'stopped')) return;
-    core.stop();
-    runningFor = null;
+    core.clearSession();
     stopStatusRefresh();
-    const cfg = ui.loadConfig(storage) || {};
-    ui.saveConfig(storage, { ...cfg, enabled: false });
+    clearAllConfirmCards();
     finishedAll = true;
-    notify('ЕМИАС: поиск завершён', 'Все цели выполнены, охотник остановился');
-    if (!showBookedBadge()) setBadge({ kind: 'idle', text: '✅ Готово', detail: 'все цели выполнены' });
+    const stopped = all.some((t) => t.state === 'stopped');
+    if (!showBookedBadge()) setBadge({
+      kind: 'finished', text: 'Поиск завершён',
+      detail: stopped ? 'Проверьте результат во вкладке ЕМИАС' : 'Все цели выполнены',
+    });
   }
 
   function onFound(payload) {
@@ -2879,35 +3006,25 @@
   function onLog(payload) { pushLog(payload); }
 
   function onSessionLost(payload) {
-    // Minor: текст payload.message раньше нигде не показывался — теперь он
-    // идёт в пояснение к значку (и в панель объяснения, см. renderRecoveryPanel).
-    setBadge({ kind: 'sessionLost', text: '🔴 Нужно войти в другой вкладке', detail: (payload && payload.message) || '' });
-    startRecoveryWatch();
+    const message = core.status().booking ? 'Проверьте, успел ли измениться приём в ЕМИАС.' : payload?.message;
+    resetSearch();
+    setBadge({ kind: 'needLogin', text: '🔴 Настройте поиск заново', detail: message || '' });
   }
 
   function onStale(payload) {
-    setBadge({ kind: 'stale', text: '🔴 Давно нет ответа от ЕМИАС', detail: 'с ' + hhmm(payload.since) });
-    startRecoveryWatch();
+    if (badgeState.kind !== 'booked') {
+      setBadge({ kind: 'stale', text: '🔴 Давно нет ответа от ЕМИАС', detail: 'с ' + hhmm(payload.since) });
+    }
   }
 
-  function onStandby(payload) {
-    runningFor = null;
-    stopStatusRefresh();
-    stopRecoveryWatch(); // M-2
-    clearAllConfirmCards(); // I6
+  function onStandby() {
+    resetSearch();
     setBadge({ kind: 'standby', text: '↔ Поиск идёт в другой вкладке', detail: '' });
-    startStandbyRetry(); // I11
   }
 
-  // C2 п.1: раннер сам останавливается и просит новый холостой прогон, если
-  // цели изменились уже во время работающего цикла (например, обошли
-  // openWizardGuarded). UI-обработчику остаётся только честно это показать —
-  // сам поиск в этот момент уже не идёт.
   function onNeedDryRun(payload) {
-    runningFor = null;
-    stopStatusRefresh();
-    clearAllConfirmCards();
-    setBadge({ kind: 'needDryRun', text: '🔴 Нужен новый холостой прогон', detail: (payload && payload.message) || '' });
+    resetSearch();
+    setBadge({ kind: 'idle', text: '🎯 Настроить', detail: payload?.message || '' });
   }
 
   // I10: исключение в любом обработчике не должно вылетать из emit() внутри
@@ -2932,239 +3049,33 @@
     core.on('needDryRun', safe(onNeedDryRun));
   }
 
-  /* ==================== обновление «время последней проверки» и восстановление ==================== */
   function startStatusRefresh() {
     stopStatusRefresh();
     statusRefreshId = setInterval(() => {
-      if (yieldIfReconfigured()) return;
-      if (badgeState.kind !== 'running' && badgeState.kind !== 'resuming') return;
-      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
+      const status = core.status();
+      if (!status.running) return;
+      try { core.checkSession(); }
+      catch (e) { onSessionLost({ message: e.message }); return; }
+      if (Date.now() - status.lastOkAt > 90000) onStale({ since: status.lastOkAt });
+      else if (badgeState.kind !== 'booked') setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
       if (panelMode === 'status') renderStatusPanel();
     }, 5000);
   }
 
-  function stopStatusRefresh() { if (statusRefreshId) clearInterval(statusRefreshId); statusRefreshId = null; }
-
-  // C-1 п.3: работающая вкладка сверяет настройки со своими. Если поиск
-  // выключили, поставили на паузу (открыли мастер) или подтвердили другие
-  // цели в другой вкладке — останавливаемся. В настройки при этом ничего не
-  // пишем: это решение другой вкладки. Дальше ведём себя как в standby —
-  // раз в минуту смотрим, не пора ли продолжить по новым условиям.
-  function yieldIfReconfigured() {
-    if (!core.status().running) return false;
-    const cfg = ui.loadConfig(storage);
-    const same = cfg && cfg.enabled && !cfg.paused && runningFor && cfg.confirmedFor === runningFor;
-    if (same) return false;
-    core.stop();
-    runningFor = null;
-    stopStatusRefresh();
-    stopRecoveryWatch();
-    clearAllConfirmCards();
-    if (!cfg || !cfg.enabled) {
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: 'поиск остановили в другой вкладке' });
-      if (panelMode === 'status' || panelMode === 'recovery') hidePanel();
-      return true;
-    }
-    setBadge({ kind: 'standby', text: '↔ Поиск перенастраивается в другой вкладке', detail: '' });
-    if (panelMode === 'status' || panelMode === 'recovery') hidePanel();
-    startStandbyRetry();
-    return true;
-  }
-
-  // M-2: наблюдение за восстановлением после sessionLost/stale не должно
-  // переживать остановку, standby и открытие мастера — иначе оно вернуло бы
-  // зелёный значок, когда поиск уже не идёт.
-  function stopRecoveryWatch() { if (recoveryWatchId) clearInterval(recoveryWatchId); recoveryWatchId = null; }
-
-  // После sessionLost/stale ждём, пока раннер сам не сделает успешную
-  // проверку (lastOkAt сдвинется вперёд) — тогда молча возвращаем зелёный
-  // значок, без перезапуска поиска человеком.
-  function startRecoveryWatch() {
-    const since = core.status().lastOkAt;
-    if (recoveryWatchId) clearInterval(recoveryWatchId);
-    recoveryWatchId = setInterval(() => {
-      const st = core.status();
-      if (st.lastOkAt > since) {
-        clearInterval(recoveryWatchId);
-        recoveryWatchId = null;
-        setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-        startStatusRefresh();
-      }
-    }, 5000);
-  }
-
-  // I11: standby — не конечное состояние. Если вкладку-лидера закрыли, эта
-  // вкладка не должна навсегда остаться на «поиск идёт в другой вкладке» —
-  // раз в минуту, пока в настройках enabled, пробуем start() заново; ядро
-  // само уладит спор вкладок через channel.
-  // C-1 п.1: стартуем не по целям из памяти вкладки, а по свежим настройкам
-  // и только после нового холостого прогона, совпавшего с подтверждённым
-  // (startFromSavedConfig). На паузе (в другой вкладке открыт мастер) или
-  // при несовпадении отпечатка — молча ждём следующей минуты.
-  // Task 12c: пока лидер жив, дорогой startFromSavedConfig() (реальные
-  // запросы к ЕМИАС по всем целям, затем мгновенный проигрыш спора вкладок
-  // и возврат в standby) звать незачем — значок на миг показывал «Ищу
-  // слоты» при живой вкладке-лидере. Лидер раз в 20 с шлёт в channel
-  // heartbeat (core.leaderSeenAt()); повторную попытку делаем, только если
-  // от него давно ничего не слышно (порог намного больше периода
-  // heartbeat — переживает пропуск одного-двух сигналов). Если недавно
-  // слышали — молча ждём следующей минуты, ничего не запрашивая.
-  const LEADER_SILENCE_MS = 90000;
-  let standbyRetryBusy = false;
-  function startStandbyRetry() {
-    if (standbyRetryId) clearInterval(standbyRetryId);
-    standbyRetryId = setInterval(async () => {
-      if (badgeState.kind !== 'standby') { clearInterval(standbyRetryId); standbyRetryId = null; return; }
-      if (standbyRetryBusy || wizard.open) return;
-      const cfg = ui.loadConfig(storage);
-      if (!cfg || !cfg.enabled) {
-        // Поиск выключили в другой вкладке — ждать больше нечего. Это
-        // дешёвая проверка настроек (localStorage), а не сеть — её незачем
-        // придерживать гейтом лидера ниже.
-        clearInterval(standbyRetryId);
-        standbyRetryId = null;
-        setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-        if (panelMode === 'standby') hidePanel();
-        return;
-      }
-      if (cfg.paused) return;
-      // Дорогой путь ниже (холостой прогон по сети) — только если от лидера
-      // давно не было вестей; сама эта проверка и всё выше — не в сеть.
-      if (Date.now() - core.leaderSeenAt() <= LEADER_SILENCE_MS) return;
-      standbyRetryBusy = true;
-      try {
-        const r = await startFromSavedConfig();
-        if (r.status !== 'started') return;
-        if (standbyRetryId) clearInterval(standbyRetryId);
-        standbyRetryId = null;
-        setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-        startStatusRefresh();
-        if (panelMode === 'standby') hidePanel();
-      } catch (e) {
-        /* нет связи или другая вкладка ещё жива — попробуем через минуту снова */
-      } finally {
-        standbyRetryBusy = false;
-      }
-    }, 60000);
-  }
-
-  /* ==================== запуск по сохранённым настройкам ==================== */
-  // Единый путь для возобновления после перезагрузки, повтора в standby и
-  // кнопки «Продолжить в этой вкладке» (C-1 п.1):
-  //   перечитать настройки → setTargets(cfg.targets) → холостой прогон →
-  //   сверить отпечаток с cfg.confirmedFor → только при совпадении
-  //   confirmDryRun + start.
-  // I-1: после прогона (он идёт по сети, это секунды) ещё раз проверяем, что
-  // попытка не устарела (не нажали «Остановить», не открыли мастер) и что
-  // настройки за это время не поменялись в другой вкладке.
-  // Возвращает { status } — 'started' | 'mismatch' (с cfg и report) |
-  // 'off' (поиск выключен/целей нет) | 'paused' | 'superseded'.
-  // Ошибки связи пробрасывает наружу.
-  function sameSavedConfig(a, b) {
-    return !!(a && b) && a.enabled === b.enabled && !!a.paused === !!b.paused &&
-      a.confirmedFor === b.confirmedFor && JSON.stringify(a.targets) === JSON.stringify(b.targets);
-  }
-
-  async function startFromSavedConfig() {
-    const attempt = ++startAttempt;
-    const cfg = ui.loadConfig(storage);
-    if (!cfg || !cfg.enabled || !Array.isArray(cfg.targets) || !cfg.targets.length) return { status: 'off' };
-    if (cfg.paused) return { status: 'paused', cfg };
-    core.setTargets(cfg.targets);
-    const report = await core.dryRun();
-    if (attempt !== startAttempt) return { status: 'superseded' };
-    const fresh = ui.loadConfig(storage);
-    if (!sameSavedConfig(cfg, fresh)) {
-      if (!fresh || !fresh.enabled) return { status: 'off' };
-      if (fresh.paused) return { status: 'paused', cfg: fresh };
-      return { status: 'superseded' };
-    }
-    if (report.targetsHash !== cfg.confirmedFor) return { status: 'mismatch', cfg, report };
-    core.confirmDryRun(report.id);
-    await core.start();
-    runningFor = cfg.confirmedFor;
-    return { status: 'started', cfg };
-  }
-
-  // Условия за пределами мастера изменились (например, структура записей
-  // на сайте) — не запускаем молча, показываем новый холостой прогон на
-  // шаге 3, чтобы человек подтвердил его ещё раз.
-  // C1: цели уже переданы в ядро и отчёт уже снят (report — по cfg.targets) —
-  // рисуем renderStep3(report) напрямую, не трогая wizard.selected и не
-  // вызывая openWizard(3)/loadStep3(), которые пересобрали бы цели из пустого
-  // wizard.selected и стёрли бы их в core.setTargets([]).
-  // I-2: значок при этом не должен оставаться зелёным — поиск не идёт.
-  function showReconfirm(cfg, report) {
-    setBadge({ kind: 'needDryRun', text: '🔴 Подтвердите условия заново', detail: 'поиск не идёт, пока вы не подтвердите' });
-    wizard.builtTargets = cfg.targets;
-    wizard.report = report;
-    wizard.checked = false;
-    panelMode = 'wizard';
-    wizard.open = true;
-    wizard.step = 3;
-    showPanel();
-    renderStep3(report);
-  }
-
-  /* ==================== возобновление после перезагрузки страницы ==================== */
-  async function resumeIfEnabled() {
-    setBadge({ kind: 'init', text: '…', detail: '' });
-    try {
-      await core.init();
-    } catch (e) {
-      setBadge(initErrorBadge(e));
-      return;
-    }
-
-    const cfg = ui.loadConfig(storage);
-    if (!cfg || !cfg.enabled || !Array.isArray(cfg.targets) || !cfg.targets.length) {
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-      return;
-    }
-    if (cfg.paused) {
-      // Мастер открывали (здесь или в другой вкладке) и новые условия ещё
-      // не подтвердили — по старым целям молча не стартуем.
-      setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'нажмите, чтобы настроить заново' });
-      return;
-    }
-
-    setBadge({ kind: 'resuming', text: '🟢 Возобновляю поиск…', detail: '' });
-    let r;
-    try {
-      r = await startFromSavedConfig();
-    } catch (e) {
-      setBadge({ kind: 'resumeError', text: '🔴 Не удалось проверить, нажмите для повтора', detail: e && e.message });
-      return;
-    }
-
-    if (r.status === 'started') {
-      if (!showBookedBadge()) setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-      startStatusRefresh();
-    } else if (r.status === 'mismatch') {
-      showReconfirm(r.cfg, r.report);
-    } else if (r.status === 'off') {
-      // I-1: пока шёл прогон, поиск выключили (здесь или в другой вкладке).
-      if (badgeState.kind === 'resuming') setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-    } else if (r.status === 'paused') {
-      if (badgeState.kind === 'resuming') setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'нажмите, чтобы настроить заново' });
-    } else if (r.status === 'superseded' && badgeState.kind === 'resuming') {
-      // Настройки поменялись в другой вкладке во время прогона — пробуем
-      // заново уже по новым.
-      resumeIfEnabled();
-    }
-    // superseded из-за «Остановить»/мастера в этой вкладке: значок уже
-    // выставлен ими, ничего не трогаем.
+  function stopStatusRefresh() {
+    if (statusRefreshId) clearInterval(statusRefreshId);
+    statusRefreshId = null;
   }
 
   /* ==================== запуск ==================== */
-  async function boot() {
+  function boot() {
     mountBadge();
     const timer = createWorkerTimer();
     let channel = null;
     try { channel = new BroadcastChannel('emias-slot-hunter'); } catch (e) { channel = null; }
-    core = create({ storage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, channel });
+    core = create({ storage: siteStorage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, channel });
     subscribeCore();
-    await resumeIfEnabled();
+    setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
   }
 
   boot();

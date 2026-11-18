@@ -1,5 +1,5 @@
 // userscript/ui-dom.js — видимый интерфейс: значок, мастер настройки из 4
-// экранов и возобновление поиска после перезагрузки страницы. Единственный
+// экранов. Единственный
 // самозапускающийся модуль — все остальные части ядра только складывают
 // себя в globalThis.EmiasCore, а этот файл их использует и рисует DOM.
 //
@@ -16,7 +16,12 @@
 
   const { create, createUiState } = globalThis.EmiasCore;
   const ui = createUiState();
-  const storage = window.localStorage;
+  const siteStorage = window.localStorage;
+  const settings = new Map();
+  const storage = {
+    getItem: (key) => settings.get(key) ?? null,
+    setItem: (key, value) => settings.set(key, value),
+  };
 
   /* ==================== состояние мастера (переменная модуля) ==================== */
   // Ничего отсюда не пишется в хранилище раньше шага 3 — см. requirements.
@@ -44,18 +49,10 @@
   // видит, если не следить за ними отдельно (см. ниже).
   const failedConfirmNodes = [];
   let statusRefreshId = null;
-  let recoveryWatchId = null;
-  let standbyRetryId = null;
   let finishedAll = false; // все цели завершились сами — поиск остановлен
   let preBookedBadge = null; // значок до последнего «Записано», чтобы вернуть текст, а не только цвет
-  // C-1: отпечаток подтверждённых целей, по которым работает ЭТА вкладка.
-  // Работающая вкладка сверяет его с настройками (startStatusRefresh) —
-  // если другая вкладка перенастроила или остановила поиск, эта уступает.
-  let runningFor = null;
-  // I-1: номер попытки запуска по сохранённым настройкам. «Остановить»,
-  // открытие мастера и новая попытка увеличивают его — старая попытка,
-  // дождавшись холостого прогона, видит, что устарела, и не стартует.
-  let startAttempt = 0;
+  let wizardLoading = false;
+  let wizardGeneration = 0;
   // I-3: временное пояснение к зелёному значку (например, «записать не
   // удалось»), чтобы обновление раз в 5 секунд не стирало его сразу.
   let badgeNote = null; // { text, until }
@@ -280,117 +277,36 @@
   function onBadgeClick() {
     if (panelMode) { hidePanel(); return; }
     const kind = badgeState.kind;
-    // C2 п.2: sessionLost/stale — мастер не открываем, только объяснение и
-    // кнопка «Остановить поиск» (сама работа тем временем продолжается сама
-    // по себе и восстановится молча через startRecoveryWatch()).
-    if (kind === 'sessionLost' || kind === 'stale') { openRecoveryPanel(); return; }
-    if (kind === 'needLogin' || kind === 'needIdentity') { retryLogin(); return; }
-    if (kind === 'resumeError') { resumeIfEnabled(); return; }
-    if (kind === 'standby') { openStandbyPanel(); return; }
     if (kind === 'booked') { acknowledgeBooked(); openStatusPanel(); return; }
-    if (kind === 'running' || kind === 'resuming') { openStatusPanel(); return; }
-    // needDryRun и любой прочий случай — безопаснее всего начать настройку заново.
-    openWizardGuarded(1);
+    if (kind === 'running' || kind === 'stale' || kind === 'finished') { openStatusPanel(); return; }
+    if (kind === 'standby') { openStandbyPanel(); return; }
+    prepareWizard();
   }
 
-  // C2 п.2: открытие мастера, когда ядро всё ещё работает по старым целям
-  // (например, кликнули «Настроить» мимо статус-панели), сначала
-  // останавливает цикл — иначе setTargets() на шаге 3 обнулит подтверждение
-  // прямо во время работающего поиска.
-  //
-  // C-1 п.2: заодно помечаем паузу в настройках — вкладки в standby не
-  // должны подхватывать поиск по старым целям, пока здесь меняют условия, а
-  // работающая вкладка (если поиск шёл не здесь) по этой метке уступает.
-  // Пауза снимается в onStart после нового подтверждения.
-  function openWizardGuarded(step) {
-    startAttempt++; // незаконченная попытка возобновления больше не стартует (I-1)
-    stopRecoveryWatch(); // M-2
-    if (core.status().running) {
-      core.stop();
-      runningFor = null;
-      stopStatusRefresh();
-      clearAllConfirmCards();
-      setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'нужен новый холостой прогон' });
+  async function prepareWizard() {
+    if (wizardLoading) return;
+    resetSearch();
+    wizardLoading = true;
+    const generation = ++wizardGeneration;
+    try {
+      await core.init();
+      if (generation === wizardGeneration) openWizard(1);
+    } catch (e) {
+      if (generation === wizardGeneration) setBadge(initErrorBadge(e));
+    } finally {
+      wizardLoading = false;
     }
-    // Настройка идёт в этой вкладке — повтор standby не должен подменять
-    // цели мастера в ядре и стартовать сам.
-    if (standbyRetryId) { clearInterval(standbyRetryId); standbyRetryId = null; }
-    if (badgeState.kind === 'standby') setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'идёт настройка' });
-    const cfg = ui.loadConfig(storage);
-    if (cfg && cfg.enabled && !cfg.paused) ui.saveConfig(storage, { ...cfg, paused: true, pausedAt: Date.now() });
-    openWizard(step);
   }
 
   function showPanel() { dom.panel.hidden = false; }
   function hidePanel() { dom.panel.hidden = true; panelMode = null; wizard.open = false; }
 
-  /* ==================== панель объяснения при sessionLost/stale ==================== */
-  function openRecoveryPanel() { panelMode = 'recovery'; showPanel(); renderRecoveryPanel(); }
-
-  function renderRecoveryPanel() {
+  function openStandbyPanel() {
+    panelMode = 'standby';
+    showPanel();
     clear(dom.panel);
-    const isStale = badgeState.kind === 'stale';
-    dom.panel.appendChild(h('h3', { text: isStale ? 'Давно нет ответа от ЕМИАС' : 'Нужно войти в ЕМИАС' }));
-    dom.panel.appendChild(h('p', { text: 'Войдите в ЕМИАС в соседней вкладке — поиск продолжится сам, ничего перезапускать не нужно.' }));
-    if (badgeState.detail) dom.panel.appendChild(h('p', { class: 'esh-note', text: badgeState.detail }));
-    dom.panel.appendChild(h('div', { class: 'esh-btns' }, [
-      h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop }),
-    ]));
-  }
-
-  /* ==================== панель standby (эта вкладка уступила другой) ==================== */
-  function openStandbyPanel() { panelMode = 'standby'; showPanel(); renderStandbyPanel(); }
-
-  function renderStandbyPanel(note) {
-    clear(dom.panel);
-    const cfg = ui.loadConfig(storage);
-    const paused = !!(cfg && cfg.paused);
-    dom.panel.appendChild(h('h3', { text: paused ? 'Условия поиска меняют в другой вкладке' : 'Поиск идёт в другой вкладке' }));
-    // C3: в этой вкладке остановить поиск нельзя — он не здесь работает, и
-    // «Остановить поиск» тут не должно ни к чему предлагать, ни менять
-    // enabled в настройках.
-    dom.panel.appendChild(h('p', {
-      text: paused
-        ? 'Когда там нажмут «Запустить охоту», поиск продолжится по новым условиям. Можно и настроить поиск здесь заново.'
-        : 'Чтобы остановить поиск, сделайте это в той вкладке ЕМИАС, где он сейчас работает.',
-    }));
-    if (note) dom.panel.appendChild(h('p', { class: 'esh-warn', text: note }));
-    dom.panel.appendChild(h('div', { class: 'esh-btns' }, [
-      paused
-        ? h('button', { class: 'esh-btn primary', text: 'Настроить здесь', onclick: () => openWizardGuarded(1) })
-        : h('button', { class: 'esh-btn primary', text: 'Продолжить в этой вкладке', onclick: onContinueHere }),
-    ]));
-  }
-
-  // I11: по клику пробуем перехватить лидерство прямо сейчас — ядро само
-  // решит спор вкладок (у чьего claim id больше).
-  // C-1 п.1: стартуем только по свежим настройкам и только после нового
-  // холостого прогона, совпавшего с подтверждённым (тот же путь, что и
-  // resumeIfEnabled) — цели из памяти вкладки могли устареть.
-  async function onContinueHere() {
-    clear(dom.panel);
-    dom.panel.appendChild(h('h3', { text: 'Поиск идёт в другой вкладке' }));
-    dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Проверяю условия поиска, подождите…' }));
-    let r;
-    try {
-      r = await startFromSavedConfig();
-    } catch (e) {
-      if (panelMode === 'standby') renderStandbyPanel('Не удалось проверить: ' + ((e && e.message) || 'нет ответа от ЕМИАС'));
-      return;
-    }
-    if (r.status === 'started') {
-      if (!showBookedBadge()) setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-      startStatusRefresh();
-      if (standbyRetryId) { clearInterval(standbyRetryId); standbyRetryId = null; }
-      hidePanel();
-    } else if (r.status === 'mismatch') {
-      showReconfirm(r.cfg, r.report);
-    } else if (r.status === 'off') {
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-      hidePanel();
-    } else if (panelMode === 'standby') {
-      renderStandbyPanel();
-    }
+    dom.panel.appendChild(h('p', { text: 'Поиск идёт в другой вкладке. Остановите его там перед запуском здесь.' }));
+    dom.panel.appendChild(h('button', { class: 'esh-btn', text: 'Настроить заново', onclick: () => { hidePanel(); prepareWizard(); } }));
   }
 
   /* ==================== лог событий (для статус-панели) ==================== */
@@ -440,7 +356,9 @@
     const logBox = renderLog(logEvents);
     dom.panel.appendChild(logBox);
     logBox.scrollTop = logScrollTop;
-    const stopBtn = h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop });
+    const stopBtn = st.running
+      ? h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop })
+      : h('button', { class: 'esh-btn primary', text: 'Настроить заново', onclick: () => { hidePanel(); prepareWizard(); } });
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [stopBtn]));
   }
 
@@ -489,12 +407,16 @@
 
   /* ==================== шаг 1: выбор направлений и записей ==================== */
   async function loadStep1() {
+    const generation = wizardGeneration;
     renderLoading('Шаг 1 из 3. За чем следить');
     try {
       const options = await core.discover();
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 1) return;
       wizard.options = options;
       renderStep1(options);
     } catch (e) {
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 1) return;
+      if (e.name === 'SessionError') { onSessionLost(e); return; }
       renderLoadError('Шаг 1 из 3. За чем следить', e && e.message, loadStep1);
     }
   }
@@ -529,6 +451,7 @@
 
   function describeOptionMeta(option) {
     const parts = [];
+    if (option.source?.doctorName) parts.push(option.source.doctorName);
     if (option.current) parts.push('сейчас записано на ' + ui.human(option.current));
     if (option.address) parts.push(ui.stripCampus(option.address));
     if (option.deadline) parts.push('направление действует по ' + option.deadline.slice(8, 10) + '.' + option.deadline.slice(5, 7));
@@ -559,10 +482,65 @@
         when: 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
         where: option.address ? 'sameCampus' : 'any', addressContains: '',
-        respectTravel: true, mode: 'auto', purpose: 'unwell',
+        respectTravel: true, mode: 'confirm', purpose: 'unwell', keepImproving: false, sameDoctor: false,
       };
     }
     return wizard.forms[option.id];
+  }
+
+  function doctorField(option, form, update) {
+    if (option.scenario !== 'shiftDoctor') return null;
+    const field = h('div', {}, [h('label', { class: 'esh-row' }, [
+      h('input', { type: 'checkbox', checked: form.sameDoctor, onchange: (event) => update({ sameDoctor: event.target.checked }) }),
+      h('span', { text: 'Только тот же врач' }),
+    ])]);
+    if (!form.sameDoctor) return field;
+    const originalName = option.source.doctorName;
+    if (option.source.availableResourceId) {
+      if (originalName) field.appendChild(h('p', { class: 'esh-note', text: originalName }));
+      return field;
+    }
+    const text = originalName ? `Текущий врач: ${originalName}. Выберите его в списке.` : 'Сверьте имя врача в текущей записи ЕМИАС и выберите его в списке.';
+    field.appendChild(h('p', { text }));
+    if (form.doctors) {
+      const items = form.doctors.map((doctor) => h('option', {
+        value: String(doctor.id), text: doctor.ambiguous ? `${doctor.name} (есть совпадения имени)` : doctor.name,
+        disabled: doctor.ambiguous, selected: form.doctor?.id === doctor.id,
+      }));
+      const placeholder = h('option', { value: '', text: 'Выберите врача', selected: !form.doctor });
+      if (items.length) {
+        field.appendChild(h('select', {
+          'aria-label': 'Врач для переноса',
+          onchange: (event) => update({ doctor: form.doctors.find((doctor) => !doctor.ambiguous && String(doctor.id) === event.target.value) }),
+        }, [placeholder, ...items]));
+      } else {
+        field.appendChild(h('p', { class: 'esh-note', text: 'ЕМИАС пока не предлагает врачей для переноса этой записи.' }));
+      }
+    }
+    if (form.doctorListError) field.appendChild(h('p', { class: 'esh-warn', text: form.doctorListError }));
+    if (!form.doctors?.some((doctor) => !doctor.ambiguous)) field.appendChild(h('button', {
+      class: 'esh-btn', disabled: !!form.loadingDoctors,
+      text: form.loadingDoctors ? 'Загружаю список…' : 'Показать список врачей',
+      onclick: () => loadDoctors(option, form, update),
+    }));
+    return field;
+  }
+
+  async function loadDoctors(option, form, update) {
+    if (form.loadingDoctors) return;
+    const generation = wizardGeneration;
+    update({ loadingDoctors: true, doctorListError: '' });
+    const visible = () => generation === wizardGeneration && wizard.open && wizard.step === 2;
+    try {
+      const doctors = await core.listDoctors(option);
+      if (visible()) update({ doctors, loadingDoctors: false });
+    } catch (error) {
+      if (!visible()) return;
+      if (error.name === 'SessionError') { onSessionLost(error); return; }
+      update({ loadingDoctors: false, doctorListError: error.message });
+    } finally {
+      form.loadingDoctors = false;
+    }
   }
 
   // Направление к врачу с needPurpose: true — сайт требует выбрать цель визита
@@ -599,7 +577,7 @@
 
   function whereField(option, form, update, quiet) {
     const opts = [
-      ...(option.address ? [['sameCampus', 'в этом же здании']] : []),
+      ...(option.address ? [['sameCampus', 'по этому же адресу (любой корпус)']] : []),
       ['any', 'где угодно'],
       ['contains', 'адрес содержит:'],
     ];
@@ -639,6 +617,8 @@
     const quiet = (patch) => { Object.assign(form, patch); refreshStepTwoState(); };
     const card = h('div', { class: 'esh-opt' });
     card.appendChild(h('div', { class: 'title', text: option.title }));
+    const doctor = doctorField(option, form, update);
+    if (doctor) card.appendChild(doctor);
     card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
     card.appendChild(whenField(option, form, update, quiet));
     card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
@@ -660,6 +640,12 @@
         h('span', { text: 'сначала спрашивать' }),
       ]),
     ]));
+    if (form.when !== 'onlyDay') {
+      card.appendChild(h('label', { class: 'esh-row' }, [
+        h('input', { type: 'checkbox', checked: form.keepImproving, onchange: (e) => update({ keepImproving: e.target.checked }) }),
+        h('span', { text: 'Продолжать искать более ранний слот после успеха' }),
+      ]));
+    }
     card.appendChild(advancedFields(form, quiet));
     const error = stepTwoError(option, form);
     const errorEl = h('p', { class: 'esh-warn', text: error || '', hidden: !error });
@@ -669,8 +655,11 @@
   }
 
   function stepTwoError(option, form) {
+    if (option.scenario === 'shiftDoctor' && form.sameDoctor && !option.source.availableResourceId && !form.doctor) return 'выберите врача для переноса';
     if (form.when === 'onlyDay' && !form.day) return 'выберите день';
     if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
+    if (form.dateFrom && form.dateTo && form.dateFrom > form.dateTo) return 'проверьте порядок дат';
+    if (form.timeFrom && form.timeTo && form.timeFrom > form.timeTo) return 'проверьте порядок времени';
     return null;
   }
 
@@ -711,14 +700,19 @@
 
   /* ==================== шаг 3: холостой прогон и запуск ==================== */
   async function loadStep3() {
+    const generation = wizardGeneration;
     renderLoading('Шаг 3 из 3. Проверка перед запуском');
     wizard.builtTargets = wizard.selected.map((o) => ui.buildTarget(o, ensureForm(o)));
     core.setTargets(wizard.builtTargets);
     try {
-      wizard.report = await core.dryRun();
+      const report = await core.dryRun();
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 3) return;
+      wizard.report = report;
       wizard.checked = false;
       renderStep3(wizard.report);
     } catch (e) {
+      if (generation !== wizardGeneration || !wizard.open || wizard.step !== 3) return;
+      if (e.name === 'SessionError') { onSessionLost(e); return; }
       renderLoadError('Шаг 3 из 3. Проверка перед запуском', e && e.message, loadStep3);
     }
   }
@@ -739,6 +733,7 @@
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: 'Шаг 3 из 3. Проверка перед запуском' }));
     dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Это холостой прогон: скрипт проверил расписание и показывает, что сделал бы прямо сейчас. Ничего не записано и не перенесено.' }));
+    dom.panel.appendChild(h('div', {}, (wizard.builtTargets || []).map((t) => h('p', { text: ui.describeTarget(t) }))));
     dom.panel.appendChild(h('div', {}, report.items.map(renderReportItem)));
     const checkbox = h('input', {
       type: 'checkbox', checked: wizard.checked,
@@ -763,43 +758,52 @@
     ]));
   }
 
-  async function onStart() {
+  async function onStart(event) {
+    if (!event.isTrusted) return;
+    event.currentTarget.disabled = true;
     // C1: защита от запуска по пустому списку целей (например, если сюда
     // всё же попали с испорченным состоянием мастера) — без неё в настройки
     // тихо сохранился бы targets: [] при зелёном значке.
     if (!wizard.builtTargets || !wizard.builtTargets.length) {
-      renderLoadError('Шаг 3 из 3. Проверка перед запуском', 'Список целей пуст — нечего запускать. Начните заново с шага 1.', () => openWizardGuarded(1));
+      renderLoadError('Шаг 3 из 3. Проверка перед запуском', 'Список целей пуст — нечего запускать. Начните заново с шага 1.', prepareWizard);
       return;
     }
     try {
+      core.checkSession();
       core.confirmDryRun(wizard.report.id);
       await core.start();
-      // C-1 п.2: новое подтверждение снимает паузу (новый объект настроек
-      // без paused/pausedAt).
-      ui.saveConfig(storage, { enabled: true, paused: false, targets: wizard.builtTargets, confirmedFor: wizard.report.targetsHash });
-      runningFor = wizard.report.targetsHash;
+      ui.saveConfig(storage, { targets: wizard.builtTargets });
       // Minor: сразу после старта проверок ещё не было — не выдумываем время
       // последней проверки.
-      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'первая проверка через минуту' });
+      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'ожидаю первую проверку' });
       startStatusRefresh();
       openWizard(4);
     } catch (e) {
+      if (e.name === 'SessionError') { onSessionLost(e); return; }
       renderLoadError('Шаг 3 из 3. Проверка перед запуском', e && e.message, () => renderStep3(wizard.report));
     }
   }
 
-  function onStop() {
-    startAttempt++; // I-1: идущая попытка возобновления после прогона не стартует
-    core.stop();
-    runningFor = null;
+  function resetSearch(finishInFlight = false) {
+    wizardGeneration++;
+    core.clearSession(finishInFlight);
     stopStatusRefresh();
-    stopRecoveryWatch(); // M-2
-    if (standbyRetryId) { clearInterval(standbyRetryId); standbyRetryId = null; }
-    clearAllConfirmCards(); // I6: живые карточки «спросить» после остановки не нужны
-    const cfg = ui.loadConfig(storage) || {};
-    ui.saveConfig(storage, { ...cfg, enabled: false });
-    setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
+    clearAllConfirmCards();
+    settings.clear();
+    logEvents.length = 0;
+    preBookedBadge = null;
+    finishedAll = false;
+    Object.assign(wizard, { options: [], selected: [], forms: {}, report: null, builtTargets: null, checked: false });
     hidePanel();
+  }
+
+  function onStop() {
+    const booking = core.status().booking;
+    resetSearch(true);
+    setBadge({
+      kind: 'idle', text: '🎯 Настроить',
+      detail: booking ? 'Проверьте, успел ли измениться приём в ЕМИАС.' : 'Поиск остановлен',
+    });
   }
 
   /* ==================== запросы на подтверждение слота (mode: confirm) ==================== */
@@ -816,11 +820,12 @@
       ? `${p.payload.title}: перенесу с ${ui.human(current)} на ${ui.human(p.payload.slot.startTime)}`
       : `${p.payload.title}: запишу на ${ui.human(p.payload.slot.startTime)}`;
     card.appendChild(h('p', { text: headText }));
-    if (p.payload.address) card.appendChild(h('p', { class: 'esh-note', text: ui.stripCampus(p.payload.address) }));
+    if (p.payload.doctorName) card.appendChild(h('p', { text: p.payload.doctorName }));
+    if (p.payload.address) card.appendChild(h('p', { class: 'esh-note', text: p.payload.address }));
     card.appendChild(h('p', { class: 'esh-note', text: `Осталось ${left} с` }));
     card.appendChild(h('div', { class: 'esh-btns' }, [
-      h('button', { class: 'esh-btn', text: 'Пропустить', onclick: () => answerConfirm(targetId, 'skip') }),
-      h('button', { class: 'esh-btn primary', text: 'Записать', onclick: () => answerConfirm(targetId, 'book') }),
+      h('button', { class: 'esh-btn', text: 'Пропустить', onclick: (e) => { if (e.isTrusted) answerConfirm(targetId, p.payload.offerId, 'skip'); } }),
+      h('button', { class: 'esh-btn primary', text: 'Записать', onclick: (e) => { if (e.isTrusted) answerConfirm(targetId, p.payload.offerId, 'book'); } }),
     ]));
     if (p.node) dom.confirms.replaceChild(card, p.node);
     else dom.confirms.appendChild(card);
@@ -845,8 +850,7 @@
   function onNeedConfirm(payload) {
     // I8: окно ответа всего 60 секунд, а вкладка обычно фоновая — без звука
     // и уведомления человек может просто не заметить запрос вовремя.
-    const where = payload.address ? ` — ${ui.stripCampus(payload.address)}` : '';
-    notify('ЕМИАС: нужно решение', `${payload.title}: ${ui.human(payload.slot.startTime)}${where} — 60 секунд на ответ`);
+    notify('ЕМИАС: найден слот', 'Откройте вкладку ЕМИАС. На решение есть 60 секунд.');
     const targetId = payload.targetId;
     removeConfirmCard(targetId);
     const tickId = setInterval(() => {
@@ -883,19 +887,19 @@
     node.appendChild(h('p', { class: warn ? 'esh-warn' : 'esh-note', text }));
   }
 
-  async function answerConfirm(targetId, decision) {
+  async function answerConfirm(targetId, offerId, decision) {
+    const p = pendingConfirms[targetId];
+    if (!p || p.busy || p.payload.offerId !== offerId) return;
     const title = titleFor(targetId);
     const bookDecision = decision === 'book';
-    const p = pendingConfirms[targetId];
-    if (!p || p.busy) return;
-    const node = p.node;
-    // Пока ждём ответ, stop()/standby всё ещё могут убрать эту карточку.
+    const node = p && p.node;
+    // Сохраняем карточку в списке, чтобы остановка могла убрать её сразу.
     clearInterval(p.tickId);
     p.busy = true;
     const dropNode = () => { if (node && node.parentNode) node.parentNode.removeChild(node); };
     if (!bookDecision) {
       removeConfirmCard(targetId);
-      try { await core.answer(targetId, 'skip'); } catch (e) { /* пропуск ничего не отправляет */ }
+      try { await core.answer(targetId, 'skip', offerId); } catch (e) { /* пропуск ничего не отправляет */ }
       return;
     }
     if (node) showCardNote(node, `${title}: записываю…`, false);
@@ -904,8 +908,8 @@
     let alreadyLogged = false;
     let cancelled = false;
     try {
-      const res = await core.answer(targetId, 'book');
-      cancelled = !!(res && res.cancelled);
+      const res = await core.answer(targetId, 'book', offerId);
+      cancelled = !!res?.aborted;
       if (!cancelled && (!res || !res.ok || !res.verified)) {
         failText = (res && res.message) || 'слот уже не актуален';
         alreadyLogged = (foundCount[targetId] || 0) > foundBefore;
@@ -916,7 +920,8 @@
     if (pendingConfirms[targetId] !== p) return;
     delete pendingConfirms[targetId];
     if (cancelled || !failText) { dropNode(); return; }
-    const text = `${title}: записать не удалось — ${failText}`;
+    if (!node?.isConnected || badgeState.kind === 'needLogin') { dropNode(); return; }
+    const text = `${title}: ${failText}`;
     if (!alreadyLogged) pushLog({ at: Date.now(), msg: text });
     if (node) {
       showCardNote(node, text, true);
@@ -928,7 +933,7 @@
       }, RESULT_NOTE_MS);
       failedConfirmNodes.push(entry);
     }
-    showBadgeNote('записать не удалось: ' + failText);
+    showBadgeNote(failText);
   }
 
   function showBadgeNote(text) {
@@ -957,20 +962,10 @@
     if (badgeNote && Date.now() < badgeNote.until) return badgeNote.text;
     badgeNote = null;
     const t = core.status().lastCheckAt;
-    return t ? 'проверено в ' + hhmm(t) : 'первая проверка через минуту';
+    return t ? 'проверено в ' + hhmm(t) : 'ожидаю первую проверку';
   }
 
   /* ==================== события ядра ==================== */
-  // core.init() двух родов ошибок: настоящее «не вошли на сайте» (кидает
-  // SessionError или обычную ошибку из core/session.js read()) и «вошли, но
-  // не удалось само определить полис/дату рождения» (IdentityError из
-  // core/index.js — идентификатор не нашёлся ни в idToken, ни в
-  // /api-eip/v2/policy/list). Раньше оба случая показывали один и тот же
-  // текст «🔒 Войдите в ЕМИАС» — по клику ядро пробовало снова, падало с той
-  // же IdentityError и человек читал ровно то же самое сообщение по кругу,
-  // хотя вход-то как раз есть. Текст для IdentityError отдельный и говорит,
-  // что реально сделать (полис в хранилище сайта появляется, когда открыт
-  // раздел «Полисы ОМС»).
   function initErrorBadge(e) {
     if (e && e.name === 'IdentityError') {
       return { kind: 'needIdentity', text: '🔒 Не нашла полис и дату рождения', detail: 'Откройте на сайте раздел «Полисы ОМС», дождитесь загрузки и нажмите ещё раз' };
@@ -978,32 +973,17 @@
     return { kind: 'needLogin', text: '🔒 Войдите в ЕМИАС', detail: e && e.message };
   }
 
-  // Если в настройках поиск включён и не на паузе, после входа просто
-  // возобновляем его (как при загрузке страницы), а не открываем мастер —
-  // иначе открытие мастера поставило бы на паузу поиск и в других вкладках.
-  function retryLogin() {
-    core.init().then(() => {
-      const cfg = ui.loadConfig(storage);
-      if (cfg && cfg.enabled && !cfg.paused && Array.isArray(cfg.targets) && cfg.targets.length) { resumeIfEnabled(); return; }
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-      openWizardGuarded(1);
-    }).catch((e) => setBadge(initErrorBadge(e)));
-  }
-
   function onBooked(payload) {
-    const where = payload.address ? ` — ${ui.stripCampus(payload.address)}` : '';
-    notify('ЕМИАС: записано', `${payload.title}: ${ui.human(payload.slot.startTime)}${where}`);
+    if (payload.afterStop) {
+      if (badgeState.kind === 'idle' && !wizard.open && !wizardLoading) {
+        setBadge({ detail: 'Ранее отправленный запрос подтверждён. Посмотрите приём в ЕМИАС.' });
+      }
+      return;
+    }
+    notify('ЕМИАС: записано', 'Подробности во вкладке ЕМИАС.');
     pushLog({ at: Date.now(), msg: `Записано: ${payload.title} — ${ui.human(payload.slot.startTime)}` });
-    // C1: раннер меняет current/source/scenario цели (перенос keepImproving)
-    // только у себя в памяти — без этого сохранённые настройки (cfg.targets)
-    // оставались бы со старыми полями, и следующий запуск по ним (перезагрузка
-    // страницы, standby-вкладка, «Продолжить в этой вкладке») мог бы перенести
-    // уже улучшенную запись НАЗАД. confirmedFor не трогаем — applyBookedUpdate
-    // меняет только сами targets.
     const cfg = ui.loadConfig(storage);
     const nextCfg = ui.applyBookedUpdate(cfg, payload);
-    // lastBooked держит оранжевый значок, пока человек его не увидит (клик),
-    // в том числе после перезагрузки страницы.
     if (nextCfg) ui.saveConfig(storage, { ...nextCfg, lastBooked: { title: payload.title, startTime: payload.slot.startTime, address: payload.address || null } });
     // Minor: раньше при возврате из «Записано» цвет менялся обратно, а текст
     // оставался старым («🟠 Записано: …») — запоминаем значок целиком (а не
@@ -1012,9 +992,7 @@
     if (!showBookedBadge()) setBadge({ kind: 'booked', text: '🟠 Записано: ' + payload.title, detail: '' });
   }
 
-  // Раньше значок «Записано» через 8 секунд сам возвращался к «Ищу слоты», и
-  // если человек не смотрел на экран, о переносе он не узнавал. Теперь значок
-  // остаётся оранжевым, пока по нему не кликнут (и после перезагрузки тоже).
+  // Показываем результат, пока пользователь не откроет панель.
   function showBookedBadge() {
     const cfg = ui.loadConfig(storage);
     const b = cfg && cfg.lastBooked;
@@ -1027,7 +1005,7 @@
     const cfg = ui.loadConfig(storage);
     if (cfg && cfg.lastBooked) { const next = { ...cfg }; delete next.lastBooked; ui.saveConfig(storage, next); }
     if (core.status().running) setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-    else if (finishedAll) setBadge({ kind: 'idle', text: '✅ Готово', detail: 'все цели выполнены' });
+    else if (finishedAll) setBadge({ kind: 'finished', text: 'Поиск завершён', detail: '' });
     else if (preBookedBadge) setBadge(preBookedBadge);
   }
 
@@ -1044,16 +1022,17 @@
 
   function onTargetDone(payload) {
     pushLog({ at: Date.now(), msg: `${payload.title}: ${payload.message}` });
-    const all = core.status().targets || [];
+    const all = core.status().targets;
     if (!all.length || !all.every((t) => t.state === 'done' || t.state === 'stopped')) return;
-    core.stop();
-    runningFor = null;
+    core.clearSession();
     stopStatusRefresh();
-    const cfg = ui.loadConfig(storage) || {};
-    ui.saveConfig(storage, { ...cfg, enabled: false });
+    clearAllConfirmCards();
     finishedAll = true;
-    notify('ЕМИАС: поиск завершён', 'Все цели выполнены, охотник остановился');
-    if (!showBookedBadge()) setBadge({ kind: 'idle', text: '✅ Готово', detail: 'все цели выполнены' });
+    const stopped = all.some((t) => t.state === 'stopped');
+    if (!showBookedBadge()) setBadge({
+      kind: 'finished', text: 'Поиск завершён',
+      detail: stopped ? 'Проверьте результат во вкладке ЕМИАС' : 'Все цели выполнены',
+    });
   }
 
   function onFound(payload) {
@@ -1064,35 +1043,25 @@
   function onLog(payload) { pushLog(payload); }
 
   function onSessionLost(payload) {
-    // Minor: текст payload.message раньше нигде не показывался — теперь он
-    // идёт в пояснение к значку (и в панель объяснения, см. renderRecoveryPanel).
-    setBadge({ kind: 'sessionLost', text: '🔴 Нужно войти в другой вкладке', detail: (payload && payload.message) || '' });
-    startRecoveryWatch();
+    const message = core.status().booking ? 'Проверьте, успел ли измениться приём в ЕМИАС.' : payload?.message;
+    resetSearch();
+    setBadge({ kind: 'needLogin', text: '🔴 Настройте поиск заново', detail: message || '' });
   }
 
   function onStale(payload) {
-    setBadge({ kind: 'stale', text: '🔴 Давно нет ответа от ЕМИАС', detail: 'с ' + hhmm(payload.since) });
-    startRecoveryWatch();
+    if (badgeState.kind !== 'booked') {
+      setBadge({ kind: 'stale', text: '🔴 Давно нет ответа от ЕМИАС', detail: 'с ' + hhmm(payload.since) });
+    }
   }
 
-  function onStandby(payload) {
-    runningFor = null;
-    stopStatusRefresh();
-    stopRecoveryWatch(); // M-2
-    clearAllConfirmCards(); // I6
+  function onStandby() {
+    resetSearch();
     setBadge({ kind: 'standby', text: '↔ Поиск идёт в другой вкладке', detail: '' });
-    startStandbyRetry(); // I11
   }
 
-  // C2 п.1: раннер сам останавливается и просит новый холостой прогон, если
-  // цели изменились уже во время работающего цикла (например, обошли
-  // openWizardGuarded). UI-обработчику остаётся только честно это показать —
-  // сам поиск в этот момент уже не идёт.
   function onNeedDryRun(payload) {
-    runningFor = null;
-    stopStatusRefresh();
-    clearAllConfirmCards();
-    setBadge({ kind: 'needDryRun', text: '🔴 Нужен новый холостой прогон', detail: (payload && payload.message) || '' });
+    resetSearch();
+    setBadge({ kind: 'idle', text: '🎯 Настроить', detail: payload?.message || '' });
   }
 
   // I10: исключение в любом обработчике не должно вылетать из emit() внутри
@@ -1117,239 +1086,33 @@
     core.on('needDryRun', safe(onNeedDryRun));
   }
 
-  /* ==================== обновление «время последней проверки» и восстановление ==================== */
   function startStatusRefresh() {
     stopStatusRefresh();
     statusRefreshId = setInterval(() => {
-      if (yieldIfReconfigured()) return;
-      if (badgeState.kind !== 'running' && badgeState.kind !== 'resuming') return;
-      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
+      const status = core.status();
+      if (!status.running) return;
+      try { core.checkSession(); }
+      catch (e) { onSessionLost({ message: e.message }); return; }
+      if (Date.now() - status.lastOkAt > 90000) onStale({ since: status.lastOkAt });
+      else if (badgeState.kind !== 'booked') setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
       if (panelMode === 'status') renderStatusPanel();
     }, 5000);
   }
 
-  function stopStatusRefresh() { if (statusRefreshId) clearInterval(statusRefreshId); statusRefreshId = null; }
-
-  // C-1 п.3: работающая вкладка сверяет настройки со своими. Если поиск
-  // выключили, поставили на паузу (открыли мастер) или подтвердили другие
-  // цели в другой вкладке — останавливаемся. В настройки при этом ничего не
-  // пишем: это решение другой вкладки. Дальше ведём себя как в standby —
-  // раз в минуту смотрим, не пора ли продолжить по новым условиям.
-  function yieldIfReconfigured() {
-    if (!core.status().running) return false;
-    const cfg = ui.loadConfig(storage);
-    const same = cfg && cfg.enabled && !cfg.paused && runningFor && cfg.confirmedFor === runningFor;
-    if (same) return false;
-    core.stop();
-    runningFor = null;
-    stopStatusRefresh();
-    stopRecoveryWatch();
-    clearAllConfirmCards();
-    if (!cfg || !cfg.enabled) {
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: 'поиск остановили в другой вкладке' });
-      if (panelMode === 'status' || panelMode === 'recovery') hidePanel();
-      return true;
-    }
-    setBadge({ kind: 'standby', text: '↔ Поиск перенастраивается в другой вкладке', detail: '' });
-    if (panelMode === 'status' || panelMode === 'recovery') hidePanel();
-    startStandbyRetry();
-    return true;
-  }
-
-  // M-2: наблюдение за восстановлением после sessionLost/stale не должно
-  // переживать остановку, standby и открытие мастера — иначе оно вернуло бы
-  // зелёный значок, когда поиск уже не идёт.
-  function stopRecoveryWatch() { if (recoveryWatchId) clearInterval(recoveryWatchId); recoveryWatchId = null; }
-
-  // После sessionLost/stale ждём, пока раннер сам не сделает успешную
-  // проверку (lastOkAt сдвинется вперёд) — тогда молча возвращаем зелёный
-  // значок, без перезапуска поиска человеком.
-  function startRecoveryWatch() {
-    const since = core.status().lastOkAt;
-    if (recoveryWatchId) clearInterval(recoveryWatchId);
-    recoveryWatchId = setInterval(() => {
-      const st = core.status();
-      if (st.lastOkAt > since) {
-        clearInterval(recoveryWatchId);
-        recoveryWatchId = null;
-        setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-        startStatusRefresh();
-      }
-    }, 5000);
-  }
-
-  // I11: standby — не конечное состояние. Если вкладку-лидера закрыли, эта
-  // вкладка не должна навсегда остаться на «поиск идёт в другой вкладке» —
-  // раз в минуту, пока в настройках enabled, пробуем start() заново; ядро
-  // само уладит спор вкладок через channel.
-  // C-1 п.1: стартуем не по целям из памяти вкладки, а по свежим настройкам
-  // и только после нового холостого прогона, совпавшего с подтверждённым
-  // (startFromSavedConfig). На паузе (в другой вкладке открыт мастер) или
-  // при несовпадении отпечатка — молча ждём следующей минуты.
-  // Task 12c: пока лидер жив, дорогой startFromSavedConfig() (реальные
-  // запросы к ЕМИАС по всем целям, затем мгновенный проигрыш спора вкладок
-  // и возврат в standby) звать незачем — значок на миг показывал «Ищу
-  // слоты» при живой вкладке-лидере. Лидер раз в 20 с шлёт в channel
-  // heartbeat (core.leaderSeenAt()); повторную попытку делаем, только если
-  // от него давно ничего не слышно (порог намного больше периода
-  // heartbeat — переживает пропуск одного-двух сигналов). Если недавно
-  // слышали — молча ждём следующей минуты, ничего не запрашивая.
-  const LEADER_SILENCE_MS = 90000;
-  let standbyRetryBusy = false;
-  function startStandbyRetry() {
-    if (standbyRetryId) clearInterval(standbyRetryId);
-    standbyRetryId = setInterval(async () => {
-      if (badgeState.kind !== 'standby') { clearInterval(standbyRetryId); standbyRetryId = null; return; }
-      if (standbyRetryBusy || wizard.open) return;
-      const cfg = ui.loadConfig(storage);
-      if (!cfg || !cfg.enabled) {
-        // Поиск выключили в другой вкладке — ждать больше нечего. Это
-        // дешёвая проверка настроек (localStorage), а не сеть — её незачем
-        // придерживать гейтом лидера ниже.
-        clearInterval(standbyRetryId);
-        standbyRetryId = null;
-        setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-        if (panelMode === 'standby') hidePanel();
-        return;
-      }
-      if (cfg.paused) return;
-      // Дорогой путь ниже (холостой прогон по сети) — только если от лидера
-      // давно не было вестей; сама эта проверка и всё выше — не в сеть.
-      if (Date.now() - core.leaderSeenAt() <= LEADER_SILENCE_MS) return;
-      standbyRetryBusy = true;
-      try {
-        const r = await startFromSavedConfig();
-        if (r.status !== 'started') return;
-        if (standbyRetryId) clearInterval(standbyRetryId);
-        standbyRetryId = null;
-        setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-        startStatusRefresh();
-        if (panelMode === 'standby') hidePanel();
-      } catch (e) {
-        /* нет связи или другая вкладка ещё жива — попробуем через минуту снова */
-      } finally {
-        standbyRetryBusy = false;
-      }
-    }, 60000);
-  }
-
-  /* ==================== запуск по сохранённым настройкам ==================== */
-  // Единый путь для возобновления после перезагрузки, повтора в standby и
-  // кнопки «Продолжить в этой вкладке» (C-1 п.1):
-  //   перечитать настройки → setTargets(cfg.targets) → холостой прогон →
-  //   сверить отпечаток с cfg.confirmedFor → только при совпадении
-  //   confirmDryRun + start.
-  // I-1: после прогона (он идёт по сети, это секунды) ещё раз проверяем, что
-  // попытка не устарела (не нажали «Остановить», не открыли мастер) и что
-  // настройки за это время не поменялись в другой вкладке.
-  // Возвращает { status } — 'started' | 'mismatch' (с cfg и report) |
-  // 'off' (поиск выключен/целей нет) | 'paused' | 'superseded'.
-  // Ошибки связи пробрасывает наружу.
-  function sameSavedConfig(a, b) {
-    return !!(a && b) && a.enabled === b.enabled && !!a.paused === !!b.paused &&
-      a.confirmedFor === b.confirmedFor && JSON.stringify(a.targets) === JSON.stringify(b.targets);
-  }
-
-  async function startFromSavedConfig() {
-    const attempt = ++startAttempt;
-    const cfg = ui.loadConfig(storage);
-    if (!cfg || !cfg.enabled || !Array.isArray(cfg.targets) || !cfg.targets.length) return { status: 'off' };
-    if (cfg.paused) return { status: 'paused', cfg };
-    core.setTargets(cfg.targets);
-    const report = await core.dryRun();
-    if (attempt !== startAttempt) return { status: 'superseded' };
-    const fresh = ui.loadConfig(storage);
-    if (!sameSavedConfig(cfg, fresh)) {
-      if (!fresh || !fresh.enabled) return { status: 'off' };
-      if (fresh.paused) return { status: 'paused', cfg: fresh };
-      return { status: 'superseded' };
-    }
-    if (report.targetsHash !== cfg.confirmedFor) return { status: 'mismatch', cfg, report };
-    core.confirmDryRun(report.id);
-    await core.start();
-    runningFor = cfg.confirmedFor;
-    return { status: 'started', cfg };
-  }
-
-  // Условия за пределами мастера изменились (например, структура записей
-  // на сайте) — не запускаем молча, показываем новый холостой прогон на
-  // шаге 3, чтобы человек подтвердил его ещё раз.
-  // C1: цели уже переданы в ядро и отчёт уже снят (report — по cfg.targets) —
-  // рисуем renderStep3(report) напрямую, не трогая wizard.selected и не
-  // вызывая openWizard(3)/loadStep3(), которые пересобрали бы цели из пустого
-  // wizard.selected и стёрли бы их в core.setTargets([]).
-  // I-2: значок при этом не должен оставаться зелёным — поиск не идёт.
-  function showReconfirm(cfg, report) {
-    setBadge({ kind: 'needDryRun', text: '🔴 Подтвердите условия заново', detail: 'поиск не идёт, пока вы не подтвердите' });
-    wizard.builtTargets = cfg.targets;
-    wizard.report = report;
-    wizard.checked = false;
-    panelMode = 'wizard';
-    wizard.open = true;
-    wizard.step = 3;
-    showPanel();
-    renderStep3(report);
-  }
-
-  /* ==================== возобновление после перезагрузки страницы ==================== */
-  async function resumeIfEnabled() {
-    setBadge({ kind: 'init', text: '…', detail: '' });
-    try {
-      await core.init();
-    } catch (e) {
-      setBadge(initErrorBadge(e));
-      return;
-    }
-
-    const cfg = ui.loadConfig(storage);
-    if (!cfg || !cfg.enabled || !Array.isArray(cfg.targets) || !cfg.targets.length) {
-      setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-      return;
-    }
-    if (cfg.paused) {
-      // Мастер открывали (здесь или в другой вкладке) и новые условия ещё
-      // не подтвердили — по старым целям молча не стартуем.
-      setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'нажмите, чтобы настроить заново' });
-      return;
-    }
-
-    setBadge({ kind: 'resuming', text: '🟢 Возобновляю поиск…', detail: '' });
-    let r;
-    try {
-      r = await startFromSavedConfig();
-    } catch (e) {
-      setBadge({ kind: 'resumeError', text: '🔴 Не удалось проверить, нажмите для повтора', detail: e && e.message });
-      return;
-    }
-
-    if (r.status === 'started') {
-      if (!showBookedBadge()) setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
-      startStatusRefresh();
-    } else if (r.status === 'mismatch') {
-      showReconfirm(r.cfg, r.report);
-    } else if (r.status === 'off') {
-      // I-1: пока шёл прогон, поиск выключили (здесь или в другой вкладке).
-      if (badgeState.kind === 'resuming') setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
-    } else if (r.status === 'paused') {
-      if (badgeState.kind === 'resuming') setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'нажмите, чтобы настроить заново' });
-    } else if (r.status === 'superseded' && badgeState.kind === 'resuming') {
-      // Настройки поменялись в другой вкладке во время прогона — пробуем
-      // заново уже по новым.
-      resumeIfEnabled();
-    }
-    // superseded из-за «Остановить»/мастера в этой вкладке: значок уже
-    // выставлен ими, ничего не трогаем.
+  function stopStatusRefresh() {
+    if (statusRefreshId) clearInterval(statusRefreshId);
+    statusRefreshId = null;
   }
 
   /* ==================== запуск ==================== */
-  async function boot() {
+  function boot() {
     mountBadge();
     const timer = createWorkerTimer();
     let channel = null;
     try { channel = new BroadcastChannel('emias-slot-hunter'); } catch (e) { channel = null; }
-    core = create({ storage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, channel });
+    core = create({ storage: siteStorage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, channel });
     subscribeCore();
-    await resumeIfEnabled();
+    setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
   }
 
   boot();

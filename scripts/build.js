@@ -14,14 +14,13 @@ const ORDER = [
 // сам header.js, а не часть метаданных, и раньше он же попадал в dist
 // ПЕРЕД // ==UserScript==, из-за чего Tampermonkey мог не опознать шапку.
 const header = fs.readFileSync(path.join(ROOT, 'userscript/header.js'), 'utf8')
-  .split('\n').filter((l) => l.startsWith('// ==') || l.startsWith('// @')).join('\n');
+  .split(/\r?\n/).filter((l) => l.startsWith('// ==') || l.startsWith('// @')).join('\n');
 
-const parts = ORDER
-  .filter((f) => fs.existsSync(path.join(ROOT, f)))
-  .map((f) => `/* ---- ${f} ---- */\n${fs.readFileSync(path.join(ROOT, f), 'utf8')}`);
+const read = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8').replace(/\r\n/g, '\n');
+const parts = ORDER.map((f) => `/* ---- ${f} ---- */\n${read(f)}`);
 
-const bundle = `${header}\n\n(function () {\n'use strict';\n${parts.join('\n')}\n})();\n`;
+const bundle = `${header}\n\n/*\n${read('LICENSE')}*/\n\n(function () {\n'use strict';\n${parts.join('\n')}\n})();\n`;
 
 fs.mkdirSync(path.join(ROOT, 'dist'), { recursive: true });
 fs.writeFileSync(path.join(ROOT, 'dist/emias-slot-hunter.user.js'), bundle);
-console.log('собрано:', path.join(ROOT, 'dist/emias-slot-hunter.user.js'), bundle.length, 'байт');
+console.log('собрано:', path.join(ROOT, 'dist/emias-slot-hunter.user.js'), Buffer.byteLength(bundle), 'байт');

@@ -1,9 +1,9 @@
 {
   "name": "emias-slot-hunter",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": false,
   "license": "MIT",
-  "description": "Ловит освободившиеся слоты в ЕМИАС и записывает/переносит приёмы",
+  "description": "Форк охотника за слотами ЕМИАС с фильтром «Только тот же врач» и проверкой перед записью",
   "scripts": {
     "test": "node scripts/check-fixtures.js && node --test test/*.test.js",
     "build": "node scripts/build.js"

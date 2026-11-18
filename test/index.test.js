@@ -195,14 +195,15 @@ function persistPersistEntry(oms) {
   return JSON.stringify({ persistOmsNumber: JSON.stringify(oms) });
 }
 
-test('identityFromStorage: дата рождения есть в idToken — policy/list не запрашивается', async () => {
+test('identityFromStorage: дата рождения берётся из выбранного полиса, даже если есть дата в idToken', async () => {
   const BIRTH_FROM_TOKEN = '2001' + '-01-01';
+  const BIRTH_FROM_POLICY = '2002' + '-02-02';
   const e = env();
   e.storage.setItem('persist:persist', persistPersistEntry(OMS));
   e.storage.setItem('persist:sessionAuth', sessionAuthEntry({ sub: 'x', birthdate: BIRTH_FROM_TOKEN }));
   let bodyUsed = null;
   const fetchFn = async (url, opts) => {
-    if (url.includes('policy/list')) throw new Error('не должно обращаться к policy/list — дата уже есть в idToken');
+    if (url.includes('policy/list')) return { ok: true, status: 200, text: async () => JSON.stringify({ payload: { policies: [{ omsNumber: OMS, birthDate: BIRTH_FROM_POLICY }] } }) };
     if (url.includes('getAppointmentReceptionsByPatient')) { bodyUsed = JSON.parse(opts.body); return { ok: true, status: 200, text: async () => JSON.stringify({ payload: { appointment: [] } }) }; }
     throw new Error('неожиданный запрос ' + url);
   };
@@ -210,7 +211,7 @@ test('identityFromStorage: дата рождения есть в idToken — pol
   await h.init();
   h.setTargets([{ id: 'x', scenario: 'unsupported', title: 'т' }]);
   await h.dryRun();
-  assert.deepEqual(bodyUsed, { omsNumber: OMS, birthDate: BIRTH_FROM_TOKEN });
+  assert.deepEqual(bodyUsed, { omsNumber: OMS, birthDate: BIRTH_FROM_POLICY });
 });
 
 test('identityFromStorage: даты нет в idToken — берём из policy/list, сверив полис с persistOmsNumber', async () => {

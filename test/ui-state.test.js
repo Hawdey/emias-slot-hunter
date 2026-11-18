@@ -132,15 +132,33 @@ test('describeTarget: prefer с timeTo и near вместе называют в�
   assert.match(s, /11:15/);
 });
 
-test('buildTarget: keepImproving зависит только от сценария', () => {
+test('buildTarget: keepImproving требует явного выбора и поддерживаемой цели', () => {
   const lab = ui.buildTarget({ ...option, scenario: 'bookLab' }, { when: 'earlier', where: 'any', mode: 'auto' });
   const referral = ui.buildTarget({ ...option, scenario: 'bookReferral' }, { when: 'earlier', where: 'any', mode: 'auto' });
-  assert.equal(lab.keepImproving, true);
+  assert.equal(lab.keepImproving, false);
   assert.equal(referral.keepImproving, false);
 });
 
-test('buildTarget: bookDoctor тоже получает keepImproving: true', () => {
-  const doctor = ui.buildTarget({ ...option, scenario: 'bookDoctor', source: { referralId: 1, needPurpose: false } }, { when: 'earlier', where: 'any', mode: 'auto' });
+test('по умолчанию спрашивает, а выбранный день исключает повторные переносы', () => {
+  const t = ui.buildTarget(option, { when: 'onlyDay', day: '2026-10-03', where: 'any', keepImproving: true });
+  assert.equal(t.mode, 'confirm');
+  assert.equal(t.keepImproving, false);
+});
+
+test('при переносе врача выбор врача применяется только с включённым ограничением', () => {
+  const doctor = { ...option, scenario: 'shiftDoctor', source: { appointmentId: 9 } };
+  const form = { when: 'earlier', where: 'any', doctor: { id: 102, name: 'Петров П.П.' } };
+  const unrestricted = ui.buildTarget(doctor, form);
+  assert.equal(unrestricted.sameDoctor, false);
+  assert.equal(unrestricted.source.availableResourceId, undefined);
+  const restricted = ui.buildTarget(doctor, { ...form, sameDoctor: true });
+  assert.equal(restricted.source.availableResourceId, 102);
+  assert.match(ui.describeTarget(restricted), /только Петров П\.П\./);
+  assert.equal(ui.buildTarget({ ...doctor, source: { ...doctor.source, availableResourceId: 77 } }, { ...form, sameDoctor: true }).source.availableResourceId, 77);
+});
+
+test('buildTarget: bookDoctor поддерживает включение keepImproving', () => {
+  const doctor = ui.buildTarget({ ...option, scenario: 'bookDoctor', source: { referralId: 1, needPurpose: false } }, { when: 'earlier', where: 'any', mode: 'auto', keepImproving: true });
   assert.equal(doctor.keepImproving, true);
 });
 
@@ -180,7 +198,7 @@ test('describeTarget: bookLdp формулируется как «Запишу �
   };
   const t = ui.buildTarget(ldpOption, { when: 'earlier', where: 'any', mode: 'auto' });
   assert.equal(t.purpose, null);
-  assert.equal(t.keepImproving, true);
+  assert.equal(t.keepImproving, false);
   const s = ui.describeTarget(t);
   assert.match(s, /^Запишу на Электрокардиография по направлению до 5 октября/);
   assert.doesNotMatch(s, /с .* по 5 октября/, 'дата уже в начале фразы — не дублируем');

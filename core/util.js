@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.5';
+  const VERSION = '0.1.7';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -21,7 +21,35 @@
     return { VERSION, mskDate, mskTime, mskDateTime, toMs, slotHHMM, distTo, campus, jitter };
   }
 
-  const api = { VERSION, createUtil };
+  // Ограничиваем и ожидание заголовков, и чтение тела ответа.
+  function createTimedFetch(fetch, timeoutMs = 12000) {
+    return async (url, opts) => {
+      if (typeof url !== 'string' || !/^\/(?:api-eip\/[a-z0-9/_-]+|web-api\/refreshTokens\/)$/i.test(url)) {
+        throw new Error('Запрос за пределами разрешённых путей ЕМИАС.');
+      }
+      const controller = new AbortController();
+      let timeout;
+      const expired = new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          reject(new Error('Истекло время ожидания ответа ЕМИАС.'));
+        }, timeoutMs);
+      });
+      const request = async () => {
+        const response = await fetch(url, { ...opts, mode: 'same-origin', redirect: 'error', signal: controller.signal });
+        if (typeof response.text !== 'function') {
+          const json = await response.json();
+          return { ok: response.ok, status: response.status, json: async () => json, text: async () => JSON.stringify(json) };
+        }
+        const text = await response.text();
+        return { ok: response.ok, status: response.status, text: async () => text, json: async () => JSON.parse(text) };
+      };
+      try { return await Promise.race([request(), expired]); }
+      finally { clearTimeout(timeout); }
+    };
+  }
+
+  const api = { VERSION, createUtil, createTimedFetch };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else { root.EmiasCore = root.EmiasCore || {}; Object.assign(root.EmiasCore, api); }
 })(typeof globalThis !== 'undefined' ? globalThis : this);

@@ -12,5 +12,8 @@ test('сборка создаёт userscript с метаданными и код
   assert.match(out, /==UserScript==/);
   assert.match(out, /@match\s+https:\/\/emias\.info\/\*/);
   assert.match(out, /EmiasCore/);
+  assert.match(out, /@downloadURL\s+none\s*$/m);
+  assert.doesNotMatch(out, /@updateURL|@require/);
+  assert.match(out, /MIT License/);
   assert.ok(!out.includes('require('), 'в собранном файле не должно остаться require()');
 });

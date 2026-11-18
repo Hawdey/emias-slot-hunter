@@ -45,9 +45,14 @@
       // Искать за пределами срока действия направления бессмысленно — если человек
       // задал dateTo позже deadline (или deadline вообще не знал), обрезаем по deadline.
       const dateTo = !form.dateTo ? null : (deadline && deadline < form.dateTo ? deadline : form.dateTo);
+      const sameDoctor = option.scenario === 'shiftDoctor' && form.sameDoctor === true;
+      const source = sameDoctor && !option.source.availableResourceId && form.doctor
+        ? { ...option.source, availableResourceId: form.doctor.id, doctorName: form.doctor.name }
+        : option.source;
 
       return {
-        id: option.id, scenario: option.scenario, title: option.title, source: option.source,
+        id: option.id, scenario: option.scenario, title: option.title, source,
+        sameDoctor,
         current: option.current || null,
         onlyDay,
         anyTime,
@@ -63,8 +68,8 @@
         respectTravel: form.respectTravel !== false,
         travelMs: 60 * 60000,
         minLeadMs: 2 * 60 * 60000,
-        keepImproving: option.scenario !== 'bookReferral',
-        mode: form.mode === 'confirm' ? 'confirm' : 'auto',
+        keepImproving: form.keepImproving === true && !anyTime && option.scenario !== 'bookReferral',
+        mode: form.mode === 'auto' ? 'auto' : 'confirm',
         purpose: (option.source && option.source.needPurpose) ? (() => {
           const chosen = INQUIRY_PURPOSES[form.purpose === 'documents' ? 'documents' : 'unwell'];
           return { inquiryPurposeId: chosen.inquiryPurposeId, inquiryPurposeCode: chosen.inquiryPurposeCode };
@@ -99,6 +104,10 @@
 
       if (t.timeFrom || t.timeTo) parts.push(`время с ${t.timeFrom || '00:00'} до ${t.timeTo || '23:59'}`);
       if (t.addressContains) parts.push(`адрес: ${t.addressContains}`);
+      if (t.scenario === 'shiftDoctor') {
+        const doctor = t.source?.doctorName || 'врач из текущей записи';
+        parts.push(t.sameDoctor ? `только ${doctor}` : 'любой врач из предложенных ЕМИАС');
+      }
       if (t.prefer) {
         let preferText = `сначала предпочитаю до ${dayHuman(t.prefer.until)}`;
         if (t.prefer.timeTo) preferText += `, до ${t.prefer.timeTo}`;
@@ -107,6 +116,7 @@
       if (t.purpose) parts.push(`цель визита: ${purposeTitle(t.purpose)}`);
       if (t.respectTravel) parts.push('с запасом на дорогу');
       parts.push(t.mode === 'confirm' ? 'спрашиваю перед записью' : 'записываю сразу');
+      parts.push(t.keepImproving ? 'продолжаю искать после успеха' : 'останавливаюсь после первого успеха');
 
       // bookDoctor и bookLdp — запись по направлению без текущей записи, для неё
       // отдельная формулировка «Запишу к <специальность> / на <исследование> по
@@ -123,7 +133,7 @@
     function describeDryRunItem(item) {
       const head = item.waiting
         ? `${item.title}: подходящих слотов сейчас нет, жду`
-        : `${item.title}: взяла бы ${human(item.would.startTime)} — ${item.would.address}`;
+        : item.would ? [`${item.title}: взяла бы ${human(item.would.startTime)}`, item.would.doctorName, item.would.address].filter(Boolean).join(' — ') : item.title;
       const warn = (item.warnings || []).map((w) => `\n  ⚠ ${w}`).join('');
       const notes = (item.notes || []).map((n) => `\n  · ${n}`).join('');
       return head + warn + notes;
@@ -132,19 +142,7 @@
     const saveConfig = (storage, cfg) => storage.setItem(KEY, JSON.stringify(cfg));
     const loadConfig = (storage) => { try { return JSON.parse(storage.getItem(KEY)) || null; } catch (e) { return null; } };
 
-    // C1: чистая функция слияния события 'booked' в сохранённые настройки —
-    // без неё после успешного переноса keepImproving current/source/scenario
-    // менялись только в памяти раннера (core/runner.js), а cfg.targets в
-    // localStorage оставался со СТАРЫМИ значениями. На перезагрузке страницы,
-    // при захвате лидерства standby-вкладкой или по кнопке «Продолжить в этой
-    // вкладке» (startFromSavedConfig) ядро стартовало заново именно по
-    // cfg.targets — и filters.pickSlots могло принять слот ХУЖЕ уже сделанного
-    // переноса, но раньше устаревшего t.current, отправив запись НАЗАД.
-    // confirmedFor намеренно не трогаем — это отпечаток целей ДО мутации (см.
-    // gateFingerprint в core/runner.js), он и должен остаться прежним, иначе
-    // обвязка ложно решила бы, что нужен новый холостой прогон.
-    // Возвращает тот же объект cfg (по ссылке), если сохранять нечего —
-    // вызывающий код (onBooked) по этому признаку решает, нужен ли saveConfig.
+    // Интерфейс хранит отдельный снимок целей для панели состояния.
     function applyBookedUpdate(cfg, payload) {
       if (!cfg || !Array.isArray(cfg.targets) || !payload || payload.targetId == null) return cfg;
       let changed = false;

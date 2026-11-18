@@ -31,7 +31,7 @@
     };
 
     function explain({ status, code, text }) {
-      if (code && KNOWN[code]) return KNOWN[code];
+      if (Object.hasOwn(KNOWN, code)) return KNOWN[code];
       // I4: в реальном пути 401 сюда не доходит — core/api.js сам перехватывает
       // 401 до вызова explain() (один раз продлевает сессию и повторяет запрос,
       // а при повторном 401 сразу бросает SessionError с тем же по смыслу
@@ -43,7 +43,7 @@
       if (status === 401) return { message: 'ЕМИАС перестал принимать вход. Войдите заново в другой вкладке — поиск продолжится сам.', action: 'relogin' };
       if (status === 429) return { message: 'ЕМИАС просит не частить — пауза 30 секунд.', action: 'wait' };
       if (status >= 500) return { message: 'ЕМИАС временно отвечает ошибкой — пауза 30 секунд.', action: 'wait' };
-      return { message: 'Непонятный ответ ЕМИАС: ' + mask(text).slice(0, 300), action: 'retry' };
+      return { message: 'ЕМИАС вернул неожиданный ответ. Повторите проверку или откройте записи на сайте.', action: 'retry' };
     }
 
     return { mask, explain };

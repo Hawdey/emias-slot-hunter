@@ -2,104 +2,67 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createSession } = require('../core/session.js');
 
-function fakeStorage(init = {}) {
-  const data = { ...init };
-  return {
-    data,
-    getItem: (k) => (k in data ? data[k] : null),
-    setItem: (k, v) => { data[k] = String(v); },
-    removeItem: (k) => { delete data[k]; },
-  };
+const SITE = 'persist:sessionAuth';
+const POLICY = 'persist:persist';
+const OLD = 'emiasSlotHunter:auth';
+const auth = (account, access = 'site-a') => JSON.stringify({
+  accessToken: JSON.stringify(access),
+  refreshToken: JSON.stringify('site-r'),
+  idToken: JSON.stringify(account),
+});
+const policy = (id) => JSON.stringify({ persistOmsNumber: JSON.stringify(id) });
+const refreshReply = { ok: true, json: async () => ({ access_token: 'new-a', refresh_token: 'new-r' }) };
+
+function setup(fetch = async () => refreshReply) {
+  const data = new Map([[SITE, auth('login-one')], [POLICY, policy('one')], [OLD, 'old-session']]);
+  const storage = { getItem: (k) => data.get(k) ?? null, removeItem: (k) => data.delete(k) };
+  return { data, session: createSession({ storage, fetch, now: () => 1234 }) };
 }
-const siteAuth = (access, refresh, ctime) => JSON.stringify({
-  accessToken: JSON.stringify(access), refreshToken: JSON.stringify(refresh),
-  idToken: 'null', ctime: JSON.stringify(ctime),
+
+test('игнорирует и удаляет старую копию токенов', () => {
+  const { data, session } = setup();
+  assert.equal(data.has(OLD), false);
+  assert.equal(session.read().access, 'site-a');
 });
 
-test('read берёт более свежие токены из своего ключа', () => {
-  const storage = fakeStorage({
-    'persist:sessionAuth': siteAuth('site-a', 'site-r', '2026-09-23T09:00:00Z'),
-    'emiasSlotHunter:auth': JSON.stringify({ access: 'mine-a', refresh: 'mine-r', at: Date.parse('2026-09-23T10:00:00Z') }),
-  });
-  const s = createSession({ storage, fetch: async () => {}, now: () => Date.parse('2026-09-23T10:30:00Z') });
-  assert.equal(s.read().access, 'mine-a');
+test('копия токенов существует только в памяти до выхода с сайта', async () => {
+  const { data, session } = setup();
+  session.read();
+  assert.equal(await session.refresh(), true);
+  assert.equal(session.token(), 'new-a');
+  assert.equal(data.has(OLD), false);
+  assert.equal(data.get(SITE), auth('login-one'));
+  data.delete(SITE);
+  assert.throws(() => session.token(), { name: 'SessionError' });
+  assert.throws(() => session.read(), /нет входа/i);
 });
 
-test('read берёт токены сайта, если вход свежее', () => {
-  const storage = fakeStorage({
-    'persist:sessionAuth': siteAuth('site-a', 'site-r', '2026-09-23T11:00:00Z'),
-    'emiasSlotHunter:auth': JSON.stringify({ access: 'mine-a', refresh: 'mine-r', at: Date.parse('2026-09-23T10:00:00Z') }),
-  });
-  const s = createSession({ storage, fetch: async () => {}, now: () => Date.parse('2026-09-23T11:30:00Z') });
-  assert.equal(s.read().access, 'site-a');
+test('сохраняет работу при ротации токена сайта с тем же входом', () => {
+  const { data, session } = setup();
+  session.read();
+  data.set(SITE, auth('login-one', 'rotated-a'));
+  assert.equal(session.token(), 'rotated-a');
 });
 
-test('read бросает понятную ошибку, если входа нет', () => {
-  const s = createSession({ storage: fakeStorage(), fetch: async () => {}, now: Date.now });
-  assert.throws(() => s.read(), /нет входа/);
+test('останавливает работу при смене входа или полиса', () => {
+  const { data, session } = setup();
+  session.read();
+  data.set(POLICY, policy('two'));
+  assert.throws(() => session.token(), { name: 'SessionError' });
+  session.read();
+  data.set(SITE, auth('login-two'));
+  assert.throws(() => session.token(), { name: 'SessionError' });
 });
 
-test('refresh перебирает ключи и сохраняет результат только в свой ключ', async () => {
-  const storage = fakeStorage({ 'persist:sessionAuth': siteAuth('a', 'site-r', '2026-09-23T09:00:00Z') });
-  const seen = [];
-  const fetchFn = async (url, opts) => {
-    const body = JSON.parse(opts.body);
-    seen.push(body.refreshToken);
-    if (body.refreshToken !== 'site-r') return { ok: false, status: 400, json: async () => ({}) };
-    return { ok: true, status: 200, json: async () => ({ access_token: 'new-a', refresh_token: 'new-r', expires_in: 3600 }) };
-  };
-  const s = createSession({ storage, fetch: fetchFn, now: () => 1000 });
-  s.setAuth({ access: 'a', refresh: 'dead-r', at: 0 });
-  assert.equal(await s.refresh(), true);
-  assert.deepEqual(seen, ['dead-r', 'site-r']);
-  assert.equal(s.token(), 'new-a');
-  assert.equal(JSON.parse(storage.data['emiasSlotHunter:auth']).refresh, 'new-r');
-  assert.equal(storage.data['persist:sessionAuth'], siteAuth('a', 'site-r', '2026-09-23T09:00:00Z'), 'хранилище сайта не изменилось');
-});
-
-test('refresh возвращает false, если все ключи мертвы', async () => {
-  const storage = fakeStorage({ 'persist:sessionAuth': siteAuth('a', 'r', '2026-09-23T09:00:00Z') });
-  const s = createSession({ storage, fetch: async () => ({ ok: false, status: 400, json: async () => ({}) }), now: () => 1 });
-  assert.equal(await s.refresh(), false);
-});
-
-test('refresh дедуплицирует параллельные вызовы', async () => {
-  const storage = fakeStorage({ 'persist:sessionAuth': siteAuth('a', 'site-r', '2026-09-23T09:00:00Z') });
-  let fetchCount = 0;
-  const fetchFn = async (url, opts) => {
-    fetchCount++;
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        resolve({ ok: true, status: 200, json: async () => ({ access_token: 'concurrent-a', refresh_token: 'concurrent-r', expires_in: 3600 }) });
-      }, 10);
-    });
-  };
-  const s = createSession({ storage, fetch: fetchFn, now: () => 1000 });
-  const r1 = s.refresh();
-  const r2 = s.refresh();
-  assert.equal(r1, r2, 'оба вызова возвращают один и тот же промис');
-  const res1 = await r1;
-  const res2 = await r2;
-  assert.equal(res1, true);
-  assert.equal(res2, true);
-  assert.equal(s.token(), 'concurrent-a');
-  assert.equal(fetchCount, 1, 'fetch вызван ровно один раз');
-});
-
-test('needsRefresh учитывает возраст токена из хранилища сайта', () => {
-  const nowMs = Date.parse('2026-09-23T10:30:00Z');
-  const storage = fakeStorage({
-    'persist:sessionAuth': siteAuth('a', 'r', '2026-09-23T10:00:00Z'),
-  });
-  const s = createSession({ storage, fetch: async () => {}, now: () => nowMs });
-  s.read();
-  assert.equal(s.needsRefresh(0.6), false, 'свежий токен (30 минут из часа) не требует обновления');
-
-  const oldNowMs = Date.parse('2026-09-23T11:30:00Z');
-  const storageOld = fakeStorage({
-    'persist:sessionAuth': siteAuth('a', 'r', '2026-09-23T10:00:00Z'),
-  });
-  const sOld = createSession({ storage: storageOld, fetch: async () => {}, now: () => oldNowMs });
-  sOld.read();
-  assert.equal(sOld.needsRefresh(0.6), true, 'старый токен (90 минут) требует обновления');
+test('запоздавшее продление не перезаписывает сессию после выхода и нового входа', async () => {
+  let reply;
+  const { data, session } = setup(() => new Promise((resolve) => { reply = resolve; }));
+  session.read();
+  const pending = session.refresh();
+  assert.equal(session.refresh(), pending);
+  data.set(SITE, auth('login-two', 'other-a'));
+  session.read();
+  reply(refreshReply);
+  await assert.rejects(pending, { name: 'SessionError' });
+  assert.equal(session.token(), 'other-a');
 });

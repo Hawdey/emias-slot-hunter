@@ -81,7 +81,87 @@ test('полный путь: нашли цель → холостой прого
   await e.timer.queue.shift()();
 
   assert.ok(e.booked(), 'слот записан');
-  assert.equal(h.status().targets[0].state, 'improving');
+  assert.equal(h.status().targets[0].state, 'done');
+});
+
+async function runLab(e, fetch, mode = 'auto') {
+  const now = () => Date.parse('2026-09-23T06:00:00Z');
+  const h = create({ storage: e.storage, fetch, now, timer: e.timer, modules });
+  await h.init({ identity: { oms: OMS, birth: '2000-01-01' } });
+  const lab = (await h.discover()).find((o) => o.scenario === 'bookLab');
+  h.setTargets([{ ...lab, mode, respectTravel: true, travelMs: 3600000, minLeadMs: 7200000 }]);
+  h.confirmDryRun((await h.dryRun()).id);
+  await h.start();
+  return h;
+}
+
+test('остановка во время запроса расписания не допускает отправки записи', async () => {
+  const e = env();
+  let enter;
+  let release;
+  const entered = new Promise((resolve) => { enter = resolve; });
+  const released = new Promise((resolve) => { release = resolve; });
+  let delay = false;
+  const h = await runLab(e, async (url, opts) => {
+    if (delay && url.includes('getAvailableResourceScheduleInfo')) { enter(); await released; }
+    return e.fetchFn(url, opts);
+  });
+  delay = true;
+  const tick = e.timer.queue.shift()();
+  await entered;
+  h.stop();
+  release();
+  await tick;
+  assert.equal(e.booked(), null);
+});
+
+test('при подтверждении учитывается конфликт, появившийся после показа слота', async () => {
+  const e = env();
+  let conflict = false;
+  const h = await runLab(e, async (url, opts) => {
+    if (conflict && url.includes('getAppointmentReceptionsByPatient')) {
+      return new Response(JSON.stringify({ payload: { appointment: [
+        { id: 51, startTime: '2026-09-24T09:00:00', endTime: '2026-09-24T09:15:00', lpuAddress: 'улица Тестовая, д. 2' },
+      ] } }));
+    }
+    return e.fetchFn(url, opts);
+  }, 'confirm');
+  let offer;
+  h.on('needConfirm', (event) => { offer = event; });
+  await e.timer.queue.shift()();
+  assert.ok(offer);
+  conflict = true;
+  const result = await h.answer(offer.targetId, 'book', offer.offerId);
+  assert.match(result.message, /пересекается/);
+  assert.equal(e.booked(), null);
+});
+
+test('недоступный список приёмов не считается пустым и блокирует запись', async () => {
+  const e = env();
+  let failed = false;
+  const h = await runLab(e, (url, opts) => {
+    if (failed && url.includes('getAppointmentReceptionsByPatient')) return new Response('', { status: 403 });
+    return e.fetchFn(url, opts);
+  });
+  let note = '';
+  h.on('log', ({ msg }) => { note = msg; });
+  failed = true;
+  await e.timer.queue.shift()();
+  assert.equal(e.booked(), null);
+  assert.match(note, /не удалось/i);
+});
+
+test('смена полиса между поиском и подтверждением останавливает запись', async () => {
+  const e = env();
+  const h = await runLab(e, e.fetchFn, 'confirm');
+  let offer;
+  h.on('needConfirm', (event) => { offer = event; });
+  await e.timer.queue.shift()();
+  assert.ok(offer);
+  e.store['persist:persist'] = JSON.stringify({ persistOmsNumber: JSON.stringify('other-policy') });
+  await assert.rejects(h.answer(offer.targetId, 'book', offer.offerId), { name: 'SessionError' });
+  assert.equal(h.status().running, false);
+  assert.equal(e.booked(), null);
 });
 
 for (const [name, options, starts, winner] of [
@@ -136,7 +216,7 @@ for (const [name, options, starts, winner] of [
       assert.equal(e.bookingRequest().startTime, expected.slot.startTime);
       assert.equal(e.bookingRequest().appointmentId, lab.source.appointmentId);
       assert.equal(e.booked().startTime, expected.slot.startTime.slice(0, 19));
-      assert.equal(h.status().targets[0].state, 'improving');
+      assert.equal(h.status().targets[0].state, 'done');
     } finally {
       h.stop();
     }

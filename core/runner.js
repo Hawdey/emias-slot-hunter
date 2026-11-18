@@ -13,17 +13,6 @@
     return 'dr' + Math.abs(h);
   }
 
-  // Ключ кандидата — чтобы после «не смог проверить» не повторять попытку
-  // ровно на том же слоте прямо на следующем тике (риск задвоить запись).
-  function candidateKey(cand) {
-    return cand.resourceId + ':' + cand.complexResourceId + ':' + cand.slot.startTime;
-  }
-
-  // Срок жизни метки «не тот же слот» после verifyFailed. Если слот всё это
-  // время остаётся единственным кандидатом, цель не должна зависать на нём
-  // бессрочно — по истечении срока попытка на том же слоте снова разрешена.
-  const VERIFY_FAILED_TTL_MS = 10 * 60 * 1000;
-
   // Поля, которые finish() может изменить сам при keepImproving после
   // успешной мутации (перенос на более удобное время). Их исключаем из
   // отпечатка гейта холостого прогона — иначе успешный перенос будет каждый
@@ -36,9 +25,6 @@
   }
 
   function createRunner({ targets, api, session, timer, now, emit, config }) {
-    // running снова станет true при перезапуске, но старые запросы всё ещё
-    // могут ждать ответа. Номер запуска не даёт им продолжить новую охоту.
-    let runId = 0;
     const state = {
       running: false,
       list: [],
@@ -53,9 +39,14 @@
       lastOkAt: 0,
       staleNotified: false,
       pending: {},
-      verifyFailedKey: {},
       leadershipHandlers: [],
     };
+    let generation = 0;
+    let offerSequence = 0;
+    let booking = null;
+    const isCurrent = (run) => state.running && run === generation
+      && state.confirmed === gateFingerprint(state.list);
+    const aborted = () => ({ ok: false, aborted: true, message: 'Запись больше не актуальна.' });
 
     const log = (msg) => emit('log', { at: now(), msg });
     // Нижняя граница интервала — 30 секунд, чтобы не нагружать ЕМИАС, даже
@@ -63,10 +54,12 @@
     const interval = () => Math.max(config.minIntervalMs, config.slowMs);
 
     function setTargets(list) {
+      const wasRunning = state.running;
+      if (wasRunning) stop();
+      else generation++;
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
       state.pending = {};
-      state.verifyFailedKey = {};
       for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
@@ -74,11 +67,16 @@
       // id старого отчёта, снятого по прежнему списку целей.
       state.confirmed = null;
       state.lastReport = null;
+      if (wasRunning) emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
     }
 
     async function appointments() {
       const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
-      return (r.json && r.json.payload && r.json.payload.appointment) || [];
+      const list = r.json?.payload?.appointment;
+      if (!r.ok || !Array.isArray(list) || list.some((a) => a?.id == null || typeof a.startTime !== 'string')) {
+        throw new Error('Не удалось получить список записей ЕМИАС. Запись приостановлена до успешной проверки.');
+      }
+      return list;
     }
 
     // Запись, которая уже есть по направлению цели новой записи (bookLab,
@@ -114,11 +112,13 @@
         emit('targetDone', { targetId: t.id, title: t.title, message });
         return true;
       }
-      t.current = a.startTime + '+03:00';
+      t.current = /(?:Z|[+-]\d\d:?\d\d)$/.test(a.startTime) ? a.startTime : a.startTime + '+03:00';
       if (t.scenario === 'bookDoctor') {
         t.source = {
           ...t.source, appointmentId: a.id, lpuId: a.lpuId || t.source.lpuId,
           specialityName: (a.toDoctor && a.toDoctor.specialityName) || t.title,
+          availableResourceId: a.toDoctor?.availableResourceId ?? a.availableResourceId ?? null,
+          doctorName: a.toDoctor?.doctorFio || null,
         };
         t.scenario = 'shiftDoctor';
       } else if (t.scenario === 'bookLdp') {
@@ -156,17 +156,21 @@
     }
 
     async function dryRun() {
+      const version = generation;
       const appts = await appointments();
+      if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
       const items = [];
       for (const t of state.list) {
-        adoptExisting(t, appts);
-        if (state.byId[t.id].state === 'done') {
-          items.push({ targetId: t.id, title: t.title, would: null, waiting: false, warnings: [], notes: [state.byId[t.id].note] });
+        const existing = existingAppointment(t, appts);
+        if (existing) {
+          const note = t.keepImproving ? 'По направлению уже есть запись. Поиск будет искать время для переноса.'
+            : 'По направлению уже есть запись. Новая запись не требуется.';
+          items.push({ targetId: t.id, title: t.title, would: null, waiting: false, warnings: [], notes: [note] });
           continue;
         }
         let r;
         try {
-          r = await targets.search(t, { now: now(), appointments: appts });
+          r = await targets.search(t, { now: now(), appointments: appts, active: () => version === generation });
         } catch (e) {
           // Холостой прогон не должен падать целиком из-за одной сбойной
           // цели — иначе человек не увидит отчёт по остальным целям и не
@@ -177,15 +181,17 @@
           });
           continue;
         }
+        if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
         const best = r.candidates[0] || null;
         items.push({
           targetId: t.id, title: t.title,
-          would: best ? { ...best.slot, address: best.address } : null,
+          would: best ? { ...best.slot, address: best.address, doctorName: best.doctorName } : null,
           waiting: !best,
           warnings: buildWarnings(t, best, r, appts),
           notes: r.notes,
         });
       }
+      if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
       const report = { id: hash({ list: state.list, at: now() }), items, targetsHash: gateFingerprint(state.list) };
       state.lastReport = report;
       return report;
@@ -201,7 +207,7 @@
 
     async function start() {
       if (state.confirmed !== gateFingerprint(state.list)) throw new Error('сначала холостой прогон и подтверждение');
-      runId++;
+      generation++;
       state.pending = {};
       state.running = true;
       state.lastTickAt = now();
@@ -215,20 +221,10 @@
     }
 
     function stop() {
-      runId++;
+      generation++;
       state.running = false;
       state.pending = {};
       timer.cancel();
-    }
-
-    function canContinue(id) {
-      if (!state.running || id !== runId) return false;
-      if (state.confirmed !== gateFingerprint(state.list)) {
-        stop();
-        emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
-        return false;
-      }
-      return true;
     }
 
     function schedule() {
@@ -238,32 +234,51 @@
       // minIntervalMs — жёсткий пол ПОСЛЕ джиттера: даже нижняя граница
       // джиттера не должна увести фактическую задержку ниже 30 секунд.
       const jittered = Math.round(base * (0.8 + Math.random() * 0.4));
-      const id = runId;
+      const run = generation;
       timer.schedule(Math.max(config.minIntervalMs, jittered), () => {
-        if (canContinue(id)) return tick();
+        if (run === generation) return tick();
       });
     }
 
-    // Три исхода targets.act(): успех (ok && verified) — цель выполнена;
-    // «не смогли проверить» (ok && !verified, включая явный verifyFailed) —
-    // мутация могла пройти, но подтвердить не удалось: цель НЕ помечаем
-    // выполненной и на этом же слоте не повторяемся прямо на следующем
-    // тике; отказ (!ok) — смотрим action.
-    async function finish(t, cand, id) {
-      const cancelled = { ok: false, verified: false, cancelled: true, message: 'поиск остановлен или изменён' };
-      if (!canContinue(id)) return cancelled;
+    async function finish(t, cand, run, expiresAt = Infinity) {
+      if (booking || !isCurrent(run)) return aborted();
+      booking = finishBooking(t, cand, run, expiresAt);
+      try {
+        return await booking;
+      } finally {
+        booking = null;
+      }
+    }
+
+    async function finishBooking(t, cand, run, expiresAt) {
+      const canSend = () => isCurrent(run) && now() < expiresAt && now() >= api.backoffUntil();
+      if (!canSend()) return aborted();
+      const scope = session.assertContext?.();
+      const canVerify = () => {
+        try { session.assertContext?.(scope); return true; }
+        catch (e) { return false; }
+      };
       const appts = await appointments();
-      if (!canContinue(id)) return cancelled;
-      // Уже отправленную запись нельзя отменить остановкой таймера:
-      // её результат всё равно проверяем и сообщаем человеку.
-      const res = await targets.act(t, cand, { now: now(), appointments: appts, canContinue: () => canContinue(id) });
-      if (res.cancelled) return cancelled;
+      if (!canSend()) return aborted();
+      if (existingAppointment(t, appts)) {
+        adoptExisting(t, appts);
+        return { ok: false, message: 'По этому направлению уже есть запись. Проверьте её в ЕМИАС.' };
+      }
+      const ctx = { now: now(), appointments: appts, canSend, canVerify };
+      const res = targets.validateCandidate?.(t, cand, ctx) || await targets.act(t, cand, ctx);
+      if (res.aborted) return aborted();
+      if (!isCurrent(run)) {
+        // Проверяем уже отправленный запрос в прежней сессии. Его результат
+        // не должен менять состояние нового запуска.
+        if (res.ok && res.verified && canVerify()) emit('booked', { afterStop: true });
+        return aborted();
+      }
 
       if (res.ok && res.verified) {
         state.byId[t.id] = { state: t.keepImproving ? 'improving' : 'done', note: res.message };
-        delete state.verifyFailedKey[t.id];
         if (t.keepImproving && res.newAppointment) {
-          t.current = res.newAppointment.startTime + '+03:00';
+          const start = res.newAppointment.startTime;
+          t.current = /(?:Z|[+-]\d\d:?\d\d)$/.test(start) ? start : start + '+03:00';
           const wasBookDoctor = t.scenario === 'bookDoctor';
           t.source = { ...t.source, appointmentId: res.newAppointment.id, moId: res.newAppointment.lpuId || t.source.moId };
           if (wasBookDoctor) {
@@ -274,6 +289,8 @@
             t.source = {
               ...t.source, lpuId: res.newAppointment.lpuId || t.source.lpuId,
               specialityName: (res.newAppointment.toDoctor && res.newAppointment.toDoctor.specialityName) || t.title,
+              availableResourceId: res.newAppointment.toDoctor?.availableResourceId ?? res.newAppointment.availableResourceId ?? cand.resourceId,
+              doctorName: res.newAppointment.toDoctor?.doctorFio || cand.doctorName || null,
             };
             t.scenario = 'shiftDoctor';
           } else if (t.scenario === 'bookLab') {
@@ -284,28 +301,20 @@
             t.scenario = 'shiftLdp';
           }
         }
-        // C1: current/source/scenario идут в событие как есть ПОСЛЕ возможной мутации
-        // выше — раннер меняет их только у себя в памяти (state.list), а обвязка
-        // (userscript) хранит цели отдельно в localStorage (cfg.targets). Без этих
-        // полей в payload обвязка не может обновить сохранённую цель и после
-        // перезагрузки/захвата другой вкладкой стартует по УСТАРЕВШИМ current/source —
-        // gateFingerprint намеренно не замечает эту рассинхронизацию (см. выше), так что
-        // дыру не поймать ни один гейт, только сама доставка актуальных полей.
+        // Интерфейс показывает обновлённую цель после переноса.
         emit('booked', {
           targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, message: res.message,
           current: t.current, source: t.source, scenario: t.scenario,
         });
+        if (!t.keepImproving) emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
         return res;
       }
 
       if (res.ok && !res.verified) {
-        // Не смогли подтвердить результат (verifyFailed или явное «готово,
-        // но в списке не вижу») — не трогаем состояние цели и запоминаем
-        // слот на VERIFY_FAILED_TTL_MS, чтобы не попытаться записаться на
-        // него же ещё раз почти сразу; после истечения срока (или если
-        // появится другой кандидат) попытка на этом слоте снова разрешена.
-        state.verifyFailedKey[t.id] = { key: candidateKey(cand), expiresAt: now() + VERIFY_FAILED_TTL_MS };
-        emit('found', { targetId: t.id, warning: res.message, slot: cand.slot, address: cand.address });
+        const message = 'Результат не подтверждён. Цель остановлена. Проверьте приём в ЕМИАС.';
+        state.byId[t.id] = { state: 'stopped', note: message };
+        emit('found', { targetId: t.id, warning: message, slot: cand.slot, address: cand.address });
+        emit('targetDone', { targetId: t.id, title: t.title, message });
         return res;
       }
 
@@ -314,7 +323,7 @@
         state.byId[t.id] = { state: 'stopped', note: res.message };
         emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
       } else if (res.action === 'relogin') {
-        emit('sessionLost', { message: res.message });
+        loseSession(res.message);
         return res;
       }
       // 'wait' | 'switchToShift' | 'retry' | null — обычный повтор на
@@ -326,22 +335,47 @@
     // Ответ пользователя на needConfirm (режим mode: 'confirm'). Раннер
     // может быть уже остановлен между needConfirm и ответом человека (или
     // намеренно, или из-за stop()) — в этом случае ничего в ЕМИАС не шлём,
-    // старые заявки снимаются при stop(), чтобы не пережить перезапуск.
-    async function answer(targetId, decision) {
+    // заявка остаётся нетронутой на случай последующего запуска.
+    async function answer(targetId, decision, offerId) {
       if (!state.running) return { ok: false, message: 'раннер остановлен, ответ не отправлен' };
       const p = state.pending[targetId];
+      if (!p || (offerId != null && offerId !== p.offerId)) return aborted();
       delete state.pending[targetId];
-      if (!p) return { ok: false, message: 'решение уже не актуально' };
+      if (now() >= p.expiresAt) return aborted();
       if (decision !== 'book') {
         log(`${p.target.title}: пользователь отклонил слот`);
         return { ok: false };
       }
-      return finish(p.target, p.candidate, runId);
+      const run = generation;
+      try { return await finish(p.target, p.candidate, run, p.expiresAt); }
+      catch (e) {
+        if (!isCurrent(run)) return aborted();
+        if (e?.name === 'SessionError') loseSession(e.message);
+        throw e;
+      }
+    }
+
+    function loseSession(message) {
+      stop();
+      session.clear?.();
+      emit('sessionLost', { message });
     }
 
     async function tick() {
-      const id = runId;
-      if (!canContinue(id)) return;
+      if (!state.running) return;
+
+      // C2: гейт холостого прогона проверяем не только в start(), но и на
+      // каждом тике — setTargets() может прийти уже во время работающего
+      // цикла (мастер меняет условия, пока человек ещё читает холостой
+      // прогон), и цикл не должен продолжать работать по неподтверждённым
+      // целям до следующего запланированного tick().
+      if (state.confirmed !== gateFingerprint(state.list)) {
+        stop();
+        emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
+        return;
+      }
+      const run = generation;
+      const active = () => isCurrent(run);
 
       // Обнаружение сна компьютера/вкладки: если между тиками прошло сильно
       // больше, чем должно быть по расписанию, — это не «мы решили не
@@ -354,29 +388,26 @@
       state.lastCheckAt = now();
 
       try {
-        if (session.needsRefresh(config.refreshAt)) await session.refresh();
-        if (!canContinue(id)) return;
+        session.assertContext?.();
         if (now() >= api.backoffUntil()) {
           const appts = await appointments();
-          if (!canContinue(id)) return;
-          // I4: потеря сессии не должна засчитываться как успешная проверка —
-          // оба break targetsLoop ниже взводят этот флаг, и lastOkAt/
-          // staleNotified обновляются только если сессия жива.
-          let relogin = false;
+          if (!active()) return;
+          // Ошибки запросов расписания не засчитываем как успешную проверку.
+          let searchOk = true;
           targetsLoop:
           for (const t of state.list) {
-            if (!canContinue(id)) return;
             // C2: backoffUntil проверяли только один раз в начале tick() (выше) — но
             // targets.search() сам может нарваться на 429 ПОСЕРЕДИНЕ этого перебора
             // (например, у первой цели), и тогда без этой проверки раннер всё равно
             // продолжил бы дёргать ЕМИАС по остальным целям в том же тике.
-            if (now() < api.backoffUntil()) break targetsLoop;
+            if (!active()) return;
+            if (now() < api.backoffUntil()) { searchOk = false; break targetsLoop; }
             const st = state.byId[t.id];
             // 'improving' — цель уже выполнена один раз, но keepImproving
             // просит продолжать искать более удобный слот, поэтому такую
             // цель не пропускаем, в отличие от 'done' и 'stopped'.
             if (st.state === 'done' || st.state === 'stopped') continue;
-            if (state.pending[t.id]) continue; // ждём решения пользователя
+            if (state.pending[t.id] || booking) continue;
 
             // Запись по направлению могла появиться во время работы (в том
             // числе руками на сайте) — тогда переходим в перенос, а не ищем
@@ -393,9 +424,9 @@
               continue;
             }
 
-            if (!canContinue(id)) return;
-            const r = await targets.search(t, { now: now(), appointments: appts });
-            if (!canContinue(id)) return;
+            const r = await targets.search(t, { now: now(), appointments: appts, active });
+            if (!active()) return;
+            if (r.action === 'wait' || r.action === 'retry') searchOk = false;
 
             if (r.action === 'stopTarget') {
               const message = (r.notes && r.notes.join('; ')) || 'цель остановлена';
@@ -408,9 +439,8 @@
               continue;
             }
             if (r.action === 'relogin') {
-              relogin = true;
-              emit('sessionLost', { message: (r.notes && r.notes.join('; ')) || 'потеряна сессия' });
-              break targetsLoop; // сессия недействительна для всех целей сразу
+              loseSession((r.notes && r.notes.join('; ')) || 'Вход в ЕМИАС закончился.');
+              return;
             }
 
             if (!r.candidates.length) {
@@ -419,38 +449,29 @@
             }
 
             const cand = r.candidates[0];
-            const key = candidateKey(cand);
-            const vf = state.verifyFailedKey[t.id];
-            if (vf) {
-              if (now() < vf.expiresAt && vf.key === key) {
-                log(`${t.title}: пропускаю тот же слот после неудачной проверки, попробую другой на следующем тике`);
-                continue;
-              }
-              // Либо срок истёк, либо появился другой кандидат — метка не актуальна.
-              delete state.verifyFailedKey[t.id];
-            }
-
             if (t.mode === 'confirm') {
               const expiresAt = now() + 60000;
-              state.pending[t.id] = { target: t, candidate: cand, expiresAt };
-              emit('needConfirm', { targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, expiresAt });
+              const offerId = ++offerSequence;
+              state.pending[t.id] = { target: t, candidate: cand, expiresAt, offerId };
+              emit('needConfirm', {
+                targetId: t.id, title: t.title, slot: cand.slot, address: cand.address,
+                doctorName: cand.doctorName, expiresAt, offerId,
+              });
               continue;
             }
 
-            const res = await finish(t, cand, id);
-            if (!canContinue(id)) return;
-            if (res.action === 'relogin') { relogin = true; break targetsLoop; }
+            const res = await finish(t, cand, run);
+            if (!active() || res.action === 'relogin') return;
           }
-          if (!canContinue(id)) return;
-          if (!relogin) {
+          if (searchOk && now() >= api.backoffUntil()) {
             state.lastOkAt = now();
             state.staleNotified = false;
           }
         }
       } catch (e) {
-        if (!canContinue(id)) return;
-        if (e && e.name === 'SessionError') emit('sessionLost', { message: e.message });
-        else log('сбой проверки: ' + (e && e.message));
+        if (!active()) return;
+        if (e?.name === 'SessionError') { loseSession(e.message); return; }
+        log('Не удалось завершить проверку. Повторю поиск.');
       }
 
       // Протухание: считаем от старта/последней удавшейся проверки. Как
@@ -471,6 +492,7 @@
     function status() {
       return {
         running: state.running,
+        booking: Boolean(booking),
         confirmed: state.confirmed === gateFingerprint(state.list),
         lastTickAt: state.lastTickAt,
         lastCheckAt: state.lastCheckAt,
@@ -493,7 +515,7 @@
       return () => { state.leadershipHandlers = state.leadershipHandlers.filter((f) => f !== fn); };
     }
 
-    return { setTargets, dryRun, confirmDryRun, start, stop, tick, answer, status, onLeadership };
+    return { setTargets, dryRun, confirmDryRun, start, stop, tick, answer, status, onLeadership, inFlightBooking: () => booking };
   }
 
   const api = { createRunner };
