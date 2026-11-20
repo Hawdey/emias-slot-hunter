@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами (личная версия)
 // @namespace    emias-slot-hunter-personal
-// @version      0.1.7
+// @version      0.2.3
 // @description  Следит за расписанием ЕМИАС и ловит освободившиеся слоты: записывает по направлению и переносит записи на более раннее время
 // @author       polinalamponi
 // @homepageURL  https://github.com/Hawdey/emias-slot-hunter
@@ -43,7 +43,7 @@ SOFTWARE.
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.7';
+  const VERSION = '0.2.3';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -80,10 +80,10 @@ SOFTWARE.
         const response = await fetch(url, { ...opts, mode: 'same-origin', redirect: 'error', signal: controller.signal });
         if (typeof response.text !== 'function') {
           const json = await response.json();
-          return { ok: response.ok, status: response.status, json: async () => json, text: async () => JSON.stringify(json) };
+          return { ok: response.ok, status: response.status, headers: response.headers, json: async () => json, text: async () => JSON.stringify(json) };
         }
         const text = await response.text();
-        return { ok: response.ok, status: response.status, text: async () => text, json: async () => JSON.parse(text) };
+        return { ok: response.ok, status: response.status, headers: response.headers, text: async () => text, json: async () => JSON.parse(text) };
       };
       try { return await Promise.race([request(), expired]); }
       finally { clearTimeout(timeout); }
@@ -128,7 +128,22 @@ SOFTWARE.
       SA_APPOINTMENT_CANNOT_BE_CANCELED: { message: 'ЕМИАС не даёт перенести эту запись: приём уже начался, запись отменена или такой перенос сайт не разрешает. Цель остановлена.', action: 'stopTarget' },
     };
 
-    function explain({ status, code, text }) {
+    function explain({ status, code, description, pauseSeconds }) {
+      if (status === 429) return { message: `ЕМИАС ограничил частоту запросов. Пауза ${pauseSeconds ?? 60} сек.`, action: 'wait' };
+      if (status >= 500) return { message: `ЕМИАС временно отвечает ошибкой. Пауза ${pauseSeconds ?? 30} сек.`, action: 'wait' };
+      if (code === 'SA_REFERRAL_FOR_FUTURE') {
+        const date = typeof description === 'string'
+          ? description.match(/^Запись по этому направлению будет доступна с (\d{4}-\d{2}-\d{2})\.?\s*$/i)?.[1]
+          : null;
+        const day = date && new Date(date);
+        const validDate = day && Number.isFinite(day.getTime()) && day.toISOString().slice(0, 10) === date;
+        return {
+          action: 'stopTarget',
+          earliestDay: validDate ? date : null,
+          message: validDate ? 'ЕМИАС указал первую дату приёма: ' + date.split('-').reverse().join('.') + '.'
+            : 'ЕМИАС не вернул дату начала приёма по направлению. Проверьте его на сайте.',
+        };
+      }
       if (Object.hasOwn(KNOWN, code)) return KNOWN[code];
       // I4: в реальном пути 401 сюда не доходит — core/api.js сам перехватывает
       // 401 до вызова explain() (один раз продлевает сессию и повторяет запрос,
@@ -139,8 +154,6 @@ SOFTWARE.
       // порядок обработки 401 в api.js когда-нибудь изменится — тест ниже
       // прямо помечен как проверка explain() в изоляции, а не сквозного пути.
       if (status === 401) return { message: 'ЕМИАС перестал принимать вход. Войдите заново в другой вкладке — поиск продолжится сам.', action: 'relogin' };
-      if (status === 429) return { message: 'ЕМИАС просит не частить — пауза 30 секунд.', action: 'wait' };
-      if (status >= 500) return { message: 'ЕМИАС временно отвечает ошибкой — пауза 30 секунд.', action: 'wait' };
       return { message: 'ЕМИАС вернул неожиданный ответ. Повторите проверку или откройте записи на сайте.', action: 'retry' };
     }
 
@@ -201,6 +214,7 @@ SOFTWARE.
       const ok = [];
       const rejected = [];
       const reject = (slot, reason) => rejected.push({ slot, reason });
+      const travelMs = t.respectTravel ? t.travelMs || 0 : 0;
 
       // onlyIfConflict: не трогаем запись, если она ни с чем не пересекается —
       // тогда искать замену незачем, возвращаем пустой результат с пометкой skipped.
@@ -209,7 +223,7 @@ SOFTWARE.
         const hasConflict = self ? !travelOk({
           selfId: t.selfId, address: self.lpuAddress,
           slot: { startTime: self.startTime, endTime: self.endTime },
-          appointments, travelMs: t.travelMs,
+          appointments, travelMs,
         }) : false;
         if (!hasConflict) return { ok: [], rejected: [], skipped: 'конфликта нет' };
       }
@@ -238,8 +252,8 @@ SOFTWARE.
         if (t.near) {
           if (curDist != null && distTo(t.near, s, toMs(slot.endTime)) >= curDist) { reject(slot, 'не ближе к нужной записи'); continue; }
         } else if (cur != null && !t.anyTime && s >= cur) { reject(slot, 'позже текущей записи'); continue; }
-        if (t.respectTravel && !travelOk({ selfId: t.selfId, address: addressOf(slot), slot, appointments, travelMs: t.travelMs })) {
-          reject(slot, 'не успеть доехать между записями'); continue;
+        if (!travelOk({ selfId: t.selfId, address: addressOf(slot), slot, appointments, travelMs })) {
+          reject(slot, travelMs ? 'пересечение или недостаточно времени на дорогу' : 'пересечение с другой записью'); continue;
         }
         ok.push(slot);
       }
@@ -384,15 +398,41 @@ SOFTWARE.
 
   const NET_STEPS = [30000, 60000, 120000, 300000];
 
-  function createApi({ session, errors, fetch, now }) {
+  function retryAfterTime(r, at) {
+    const header = r.headers?.get?.('Retry-After')?.trim();
+    if (!header) return 0;
+    const time = /^\d+$/.test(header) ? at + Number(header) * 1000 : Date.parse(header);
+    return Number.isSafeInteger(time) ? time : 0;
+  }
+
+  function createApi({ session, errors, fetch, now, wait }) {
     let backoffUntil = 0;
     let netStep = -1;
+    let nextRequestAt = 0;
+    let queue = Promise.resolve();
+
+    function waitForTurn(canSend) {
+      const turn = queue.then(async () => {
+        if (canSend && !canSend()) return;
+        if (now() < backoffUntil) return;
+        const delay = nextRequestAt - now();
+        if (delay > 0) await wait(delay);
+        if ((!canSend || canSend()) && now() >= backoffUntil) nextRequestAt = now() + 2000;
+      });
+      queue = turn.catch(() => {});
+      return turn;
+    }
 
     // Общая часть post() и get(): заголовки, сетевой бэкофф, продление сессии
     // по 401, разбор ответа. body === undefined → запрос без тела (GET), с
     // телом → Content-Type и JSON.stringify (POST).
     async function request(method, path, body, retried, canSend) {
+      if (wait) await waitForTurn(canSend);
       if (canSend && !canSend()) return { ok: false, aborted: true };
+      if (now() < backoffUntil) {
+        const seconds = Math.ceil((backoffUntil - now()) / 1000);
+        return { ok: false, status: 429, json: null, explained: { message: `Пауза ЕМИАС. Следующий запрос через ${seconds} сек.`, action: 'wait' } };
+      }
       const headers = { Accept: 'application/json', 'EI-Token': session.token(), 'X-App': 'portal' };
       const opts = { method, headers };
       if (body !== undefined) {
@@ -407,7 +447,7 @@ SOFTWARE.
       } catch (e) {
         // Увеличиваем паузу при сетевой ошибке: 30s → 60s → 120s → 300s
         netStep = Math.min(netStep + 1, NET_STEPS.length - 1);
-        backoffUntil = now() + NET_STEPS[netStep];
+        backoffUntil = Math.max(backoffUntil, now() + NET_STEPS[netStep]);
         return { ok: false, status: 0, json: null, explained: { message: 'Нет связи с ЕМИАС — попробую позже.', action: 'wait' } };
       }
       // Сброс счётчика сетевых ошибок при успешном соединении
@@ -433,23 +473,27 @@ SOFTWARE.
       // для 401 (см. explain()), чтобы текст не расходился в зависимости от
       // того, через какой путь сессия оказалась потеряна.
       if (r.status === 401) throw new SessionError('Вход в ЕМИАС закончился. Войдите заново и настройте поиск.');
-      // 429 и 5xx ошибки требуют паузу
-      if (r.status === 429 || r.status >= 500) backoffUntil = now() + 30000;
+      let pauseSeconds;
+      if (r.status === 429 || r.status >= 500) {
+        const at = now();
+        backoffUntil = Math.max(backoffUntil, at + (r.status === 429 ? 60000 : 30000), retryAfterTime(r, at));
+        pauseSeconds = Math.ceil((backoffUntil - at) / 1000);
+      }
 
       // Если 2xx статус но JSON не разобрался и текст не пустой (например, HTML-заглушка) — это ошибка
       // Пустой текст с 2xx считается успехом (json: null)
       if (r.ok && json === null && text.trim() !== '') {
         return {
           ok: false, status: r.status, json: null,
-          explained: errors.explain({ status: r.status, code: undefined, text }),
+          explained: errors.explain({ status: r.status }),
         };
       }
 
-      const err = json && (json.error || (json.errorCode ? { code: json.errorCode } : null));
+      const err = json && (json.error || (json.errorCode ? { code: json.errorCode, description: json.description } : null));
       const ok = r.ok && !err;
       return {
         ok, status: r.status, json,
-        explained: ok ? null : errors.explain({ status: r.status, code: err && err.code, text }),
+        explained: ok ? null : errors.explain({ status: r.status, code: err?.code, description: err?.description, pauseSeconds }),
       };
     }
 
@@ -550,8 +594,9 @@ SOFTWARE.
       // Направления без активной записи: к врачу (toDoctor) — цель bookDoctor,
       // на исследование (toLdp) — bookLdp. Запросы bookLdp взяты по аналогии с
       // bookDoctor и на живом сайте ещё не сняты.
+      const bookedReferrals = new Set(out.filter((o) => o.source.referralId != null).map((o) => String(o.source.referralId)));
       for (const ref of (ar.referrals && ar.referrals.items) || []) {
-        if (ref.countActiveAppointment > 0) continue;
+        if (ref.countActiveAppointment > 0 || bookedReferrals.has(String(ref.id))) continue;
         if (expired(ref.endTime)) continue;
         if (ref.toDoctor) {
           const title = ref.toDoctor.specialityName + (ref.toDoctor.doctorFio ? ' — ' + ref.toDoctor.doctorFio : '');
@@ -653,48 +698,71 @@ SOFTWARE.
     // bookLab, bookDoctor и bookLdp — сценарии новой записи; остальные — переносы
     // существующих записей и требуют appointmentId в каждом запросе к ЕМИАС.
     const isShift = (t) => !['bookLab', 'bookDoctor', 'bookLdp'].includes(t.scenario);
+    const isLab = (t) => t.scenario === 'bookLab' || t.scenario === 'shiftLab';
     const isReferralBooking = (t) => t.scenario === 'bookDoctor' || t.scenario === 'bookLdp';
     const isDoctor = (t) => t.scenario === 'shiftDoctor' || t.scenario === 'bookDoctor';
     const sameResource = (a, b) => a != null && a !== '' && b != null && b !== '' && String(a) === String(b);
+    const addressKey = (address) => String(address || '').trim().toLowerCase().replace(/\s+/g, ' ').replace(/\s*,\s*/g, ',');
+    const exactAddresses = (t) => Array.isArray(t.exactAddresses) && t.exactAddresses.length
+      ? t.exactAddresses : t.addressExact ? [t.addressExact] : [];
+    function matchesAddress(t, address) {
+      const key = addressKey(address);
+      const allowed = exactAddresses(t);
+      return (!allowed.length || allowed.some((entry) => addressKey(entry) === key))
+        && (!t.addressContains || key.includes(addressKey(t.addressContains)));
+    }
     const sameDoctorShift = (t) => t.scenario === 'shiftDoctor' && t.sameDoctor === true;
     const requiresDoctor = (t) => sameDoctorShift(t) || (t.scenario === 'bookDoctor' && !!t.source.availableResourceId);
     const doctorMismatch = () => ({
       ok: false, action: 'stopTarget', message: 'Не удалось подтвердить выбранного врача. Настройте поиск заново.',
     });
 
-    // Период поиска: не раньше сегодняшнего дня (и не раньше dateFrom цели).
-    // Верхняя граница — в таком порядке: onlyDay; день текущей записи (для
-    // обычного переноса без anyTime — искать позже неё бессмысленно); dateTo
-    // цели. Если ничего из этого не задано (а discover.js в v0.1 не
-    // проставляет dateTo ни одной цели), раньше поиск схлопывался в «только
-    // сегодня», и охотник неделями смотрел на один день, ничего не находя и
-    // не сообщая об этом. Теперь в этом случае берём deadline цели (срок
-    // действия направления), а если и его нет — смотрим на 30 дней вперёд.
-    const period = (t, now) => {
-      const today = util.mskDate(new Date(now));
-      const dateFrom = t.dateFrom && t.dateFrom > today ? t.dateFrom : today;
-      const explicitLast = t.onlyDay || (t.current && !t.anyTime ? t.current.slice(0, 10) : t.dateTo) || t.dateTo;
-      const defaultHorizon = () => util.mskDate(new Date(now + 30 * 24 * 3600000));
-      const last = explicitLast || t.deadline || defaultHorizon();
-      return { dateFrom, dateTo: last < dateFrom ? dateFrom : last };
-    };
+    // Дата из SA_REFERRAL_FOR_FUTURE ограничивает даты слотов. Её можно
+    // использовать в запросе сразу, не дожидаясь наступления этого дня.
+    const earliestDays = new WeakMap();
+    const roomProgress = new WeakMap();
+    const resourceCache = new WeakMap();
+    const RESOURCE_CACHE_MS = 120000;
+    const defaultEnd = (now) => util.mskDate(new Date(now + 30 * 24 * 3600000));
 
-    async function listResources(t, p) {
-      if (t.scenario === 'bookLab' || t.scenario === 'shiftLab') {
+    function period(t, now, earliestDay) {
+      const today = util.mskDate(new Date(now));
+      const first = [today, t.onlyDay, t.dateFrom, earliestDay].filter(Boolean).sort().at(-1);
+      const currentDay = t.current && !t.anyTime ? t.current.slice(0, 10) : null;
+      const last = [t.onlyDay, currentDay, t.dateTo, t.deadline?.slice(0, 10)].filter(Boolean).sort()[0]
+        || defaultEnd(now);
+      return { dateFrom: first, dateTo: last };
+    }
+
+    function requestPeriod(t, now, selected, earliestDay) {
+      const horizon = defaultEnd(now);
+      if (!isLab(t) || selected.dateTo > horizon) return selected;
+      // Календарь ЕМИАС запрашивает лаборатории и их расписание на 30 дней.
+      // Узкий запрос на одну дату может быть отклонён даже для доступного дня.
+      const today = util.mskDate(new Date(now));
+      return { dateFrom: earliestDay && earliestDay > today ? earliestDay : today, dateTo: horizon };
+    }
+
+    function searchFailure(message, action = null, earliestDay = null) {
+      return { candidates: [], rejected: [], notes: [message], action, earliestDay };
+    }
+
+    async function listResources(t, p, active) {
+      if (isLab(t)) {
         // Пока у пациента есть активная запись на это же лабораторное исследование,
         // ЕМИАС отклоняет поиск слотов для НОВОЙ записи — нужен режим переноса
         // с appointmentId и moId (lpuId) текущей записи в assignment.
         const body = t.scenario === 'bookLab'
           ? { assignment: { moId: t.source.moId, samplingTypeId: t.source.samplingTypeId, period: p } }
           : { appointmentId: t.source.appointmentId, assignment: { moId: t.source.moId, samplingTypeId: t.source.samplingTypeId, period: p } };
-        return api.post('v4/saOrchestrator/getDoctorsInfoForLI', body);
+        return api.post('v4/saOrchestrator/getDoctorsInfoForLI', body, active);
       }
       if (isReferralBooking(t)) {
         // Новая запись по направлению — без appointmentId и без
         // purposeReceptionForm (это поле относится только к переносу).
-        return api.post('v5/saOrchestrator/getDoctorsInfo', { referralId: t.source.referralId });
+        return api.post('v5/saOrchestrator/getDoctorsInfo', { referralId: t.source.referralId }, active);
       }
-      return api.post('v5/saOrchestrator/getDoctorsInfo', { appointmentId: t.source.appointmentId, purposeReceptionForm: 'personal' });
+      return api.post('v5/saOrchestrator/getDoctorsInfo', { appointmentId: t.source.appointmentId, purposeReceptionForm: 'personal' }, active);
     }
 
     async function listDoctors(option) {
@@ -711,6 +779,16 @@ SOFTWARE.
         .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
     }
 
+    async function listAddresses(t, ctx) {
+      if (ctx.now < api.backoffUntil()) throw new Error('ЕМИАС попросил паузу. Попробуйте позже.');
+      const result = await search(t, { ...ctx, addressesOnly: true });
+      if (!result.addresses?.length && result.action) throw new Error(result.notes[0] || 'Не удалось загрузить адреса.');
+      return {
+        addresses: result.addresses || [],
+        notice: result.action ? 'Список загружен частично. Его можно обновить.' : '',
+      };
+    }
+
     async function search(t, ctx) {
       if (!SUPPORTED_SCENARIOS.has(t.scenario)) {
         return { candidates: [], rejected: [], notes: [UNSUPPORTED_MESSAGE], action: null };
@@ -725,16 +803,45 @@ SOFTWARE.
         const failure = doctorMismatch();
         return { candidates: [], rejected: [], notes: [failure.message], action: failure.action };
       }
-      const p = period(t, ctx.now);
+      const remembered = earliestDays.get(t);
+      const knownDay = remembered && remembered.source === t.source ? remembered.day : null;
+      const initial = period(t, ctx.now, knownDay);
+      if (initial.dateFrom > initial.dateTo) {
+        return searchFailure('В выбранном диапазоне нет допустимых дат для этой цели.', 'stopTarget');
+      }
+      const requested = requestPeriod(t, ctx.now, initial, knownDay);
+      const result = await searchPeriod(t, ctx, initial, requested);
+      const first = result.earliestDay;
+      if (!first || (ctx.active && !ctx.active()) || ctx.now < api.backoffUntil()) return result;
+      if (first > initial.dateTo) {
+        return searchFailure(result.notes[0] + ' Она позже выбранного диапазона. Измените даты поиска.', 'stopTarget');
+      }
+      if (first <= requested.dateFrom) {
+        return searchFailure(result.notes[0] + ' ЕМИАС отклонил запрос на этот период. Проверьте расписание на сайте.', 'stopTarget');
+      }
+      earliestDays.set(t, { source: t.source, day: first });
+      const selected = period(t, ctx.now, first);
+      const retry = await searchPeriod(t, ctx, selected, requestPeriod(t, ctx.now, selected, first));
+      if (!retry.earliestDay) return retry;
+      return searchFailure(retry.notes[0] + ' ЕМИАС отклонил уточнённый диапазон. Проверьте расписание на сайте.', 'stopTarget');
+    }
+
+    async function searchPeriod(t, ctx, selected, requested) {
+      const inBackoff = () => ctx.now < api.backoffUntil();
+      if (inBackoff()) return searchFailure('Проверка отложена до окончания паузы ЕМИАС.', 'wait');
+      if (ctx.budget && !ctx.budget.remaining) {
+        return searchFailure('Проверю расписание в следующем цикле. Лимит запросов исчерпан.');
+      }
       const notes = [];
       let action = null;
-      const res = await listResources(t, p);
+      const cached = ctx.reuseResources ? resourceCache.get(t) : null;
+      const periodKey = isLab(t) ? requested.dateFrom + '/' + requested.dateTo : '';
+      const fromCache = cached && cached.source === t.source && cached.periodKey === periodKey && ctx.now < cached.expiresAt;
+      if (!fromCache && ctx.budget) ctx.budget.remaining--;
+      const res = fromCache ? cached.result : await listResources(t, requested, ctx.active);
       if (!res.ok) {
-        return {
-          candidates: [], rejected: [],
-          notes: [res.explained ? res.explained.message : 'ЕМИАС не отдал список кабинетов'],
-          action: (res.explained && res.explained.action) || null,
-        };
+        return searchFailure(res.explained?.message || 'ЕМИАС не отдал список кабинетов',
+          res.explained?.action, isLab(t) ? res.explained?.earliestDay : null);
       }
       let resources = collectResources(res.json && res.json.payload);
       if (requiresDoctor(t)) {
@@ -744,74 +851,118 @@ SOFTWARE.
         }
       }
       if (!resources.length) return { candidates: [], rejected: [], notes: ['Свободных кабинетов или врачей сейчас нет'], action: null };
+      if (ctx.reuseResources && !fromCache && (!ctx.active || ctx.active())) {
+        resourceCache.set(t, { source: t.source, periodKey, expiresAt: ctx.now + RESOURCE_CACHE_MS, result: res });
+      }
 
       const candidates = [];
+      const addresses = new Map();
+      const rememberAddress = (value) => {
+        if (typeof value === 'string' && value.trim()) addresses.set(addressKey(value), value.trim());
+      };
       let rejected = [];
       let addressMismatch = 0;
       let addressUnknown = 0;
       let doctorUnknown = false;
-      // C2: без этой проверки цикл продолжал бы слать getAvailableResourceScheduleInfo
-      // по всем оставшимся кабинетам/врачам даже после того, как ЕМИАС уже ответил 429 —
-      // от одной цели с десятками ресурсов в один тик могло уйти десятки запросов подряд.
-      // ctx.now — снимок времени на момент вызова search(), тот же now(), которым api.js
-      // выставляет backoffUntil, так что сравнение честное в пределах одного вызова.
-      let pausedByBackoff = false;
-      resourceLoop:
+      const rooms = [];
+      const requiresExactAddress = exactAddresses(t).length > 0;
       for (const r of resources) {
         for (const cr of r.complexResource) {
-          if (ctx.active && !ctx.active()) break resourceLoop;
-          if (ctx.now < api.backoffUntil()) { pausedByBackoff = true; break resourceLoop; }
-          const body = { availableResourceId: r.id, complexResourceId: cr.id, period: p };
-          if (isShift(t)) body.appointmentId = t.source.appointmentId;
-          // Перенос исследования иногда требует ещё и referralId — если он есть у цели, передаём сразу.
-          if (isShift(t) && t.source.referralId) body.referralId = t.source.referralId;
-          if (isReferralBooking(t)) {
-            body.referralId = t.source.referralId;
-            if (t.purpose && t.purpose.inquiryPurposeId) body.inquiryPurposeId = t.purpose.inquiryPurposeId;
-          }
-          const s = await api.post('v4/saOrchestrator/getAvailableResourceScheduleInfo', body);
-          if (!s.ok) {
-            notes.push(s.explained ? s.explained.message : 'расписание недоступно');
-            action = (s.explained && s.explained.action) || action;
-            continue;
-          }
-          const payload = s.json?.payload;
-          if (sameDoctorShift(t) && !sameResource(payload?.availableResource?.id, r.id)) {
-            doctorUnknown = true;
-            continue;
-          }
-          const address = scheduleAddress(payload, cr.id);
-          if (!address) { addressUnknown++; continue; }
-          if (t.addressContains && !address.toLowerCase().includes(String(t.addressContains).toLowerCase())) { addressMismatch++; continue; }
-          const slots = scheduleSlots(payload, cr.id);
-          const picked = filters.pickSlots({
-            slots,
-            target: { ...t, selfId: t.source.appointmentId || null },
-            now: ctx.now, appointments: ctx.appointments, addressOf: () => address,
-          });
-          // onlyIfConflict мог решить, что переносить нечего (конфликта нет) — без этой
-          // строки в notes человек видел бы пустой список без объяснения причины.
-          if (picked.skipped) notes.push(picked.skipped);
-          rejected = rejected.concat(picked.rejected.map((x) => ({ ...x, address })));
-          for (const slot of picked.ok) candidates.push({
-            slot, address, resourceId: r.id, complexResourceId: cr.id, name: r.name,
-            doctorName: isDoctor(t) ? (r.name || t.source.doctorName || null) : null,
-          });
+          const listedAddress = typeof cr.room?.defaultAddress === 'string' ? cr.room.defaultAddress.trim() : '';
+          if (ctx.addressesOnly && listedAddress) rememberAddress(listedAddress);
+          else if (requiresExactAddress && !ctx.addressesOnly && listedAddress && !matchesAddress(t, listedAddress)) addressMismatch++;
+          else rooms.push({ r, cr, key: JSON.stringify([String(r.id), String(cr.id)]) });
         }
+      }
+      // Продолжаем незавершённый проход. Отложенный после сбоя кабинет
+      // возвращается в очередь после прохода по остальным кабинетам.
+      const saved = ctx.addressesOnly ? null : roomProgress.get(t);
+      const range = selected.dateFrom + '/' + selected.dateTo;
+      const sameSearch = saved && saved.source === t.source && saved.range === range;
+      const checked = new Set(sameSearch ? saved.checked : []);
+      const postponed = new Set(sameSearch ? saved.postponed : []);
+      let queue = rooms.filter(({ key }) => !checked.has(key) && !postponed.has(key));
+      if (!queue.length) {
+        checked.clear();
+        queue = rooms.filter(({ key }) => !postponed.has(key));
+        if (!queue.length) {
+          postponed.clear();
+          queue = rooms;
+        }
+      }
+      let pausedByBackoff = false;
+      let reachedLimit = false;
+      for (const { r, cr, key } of queue) {
+        if (ctx.active && !ctx.active()) break;
+        if (inBackoff()) { pausedByBackoff = true; break; }
+        if (ctx.budget && !ctx.budget.remaining) { reachedLimit = true; break; }
+        if (ctx.budget) ctx.budget.remaining--;
+        checked.add(key);
+        const body = { availableResourceId: r.id, complexResourceId: cr.id, period: requested };
+        if (isShift(t)) body.appointmentId = t.source.appointmentId;
+        // Перенос исследования иногда требует ещё и referralId — если он есть у цели, передаём сразу.
+        if (isShift(t) && t.source.referralId) body.referralId = t.source.referralId;
+        if (isReferralBooking(t)) {
+          body.referralId = t.source.referralId;
+          if (t.purpose && t.purpose.inquiryPurposeId) body.inquiryPurposeId = t.purpose.inquiryPurposeId;
+        }
+        const s = await api.post('v4/saOrchestrator/getAvailableResourceScheduleInfo', body, ctx.active);
+        if (!s.ok) {
+          if (s.explained?.action === 'stopTarget') {
+            return searchFailure(s.explained.message, s.explained.action, s.explained.earliestDay);
+          }
+          notes.push(s.explained ? s.explained.message : 'расписание недоступно');
+          action = (s.explained && s.explained.action) || action;
+          if (inBackoff()) postponed.add(key);
+          continue;
+        }
+        const payload = s.json?.payload;
+        if (sameDoctorShift(t) && !sameResource(payload?.availableResource?.id, r.id)) {
+          doctorUnknown = true;
+          continue;
+        }
+        const address = scheduleAddress(payload, cr.id);
+        if (!address) { addressUnknown++; continue; }
+        if (ctx.addressesOnly) {
+          rememberAddress(address);
+          continue;
+        }
+        if (!matchesAddress(t, address)) { addressMismatch++; continue; }
+        const slots = scheduleSlots(payload, cr.id);
+        const picked = filters.pickSlots({
+          slots,
+          target: { ...t, dateFrom: selected.dateFrom, dateTo: selected.dateTo, selfId: t.source.appointmentId || null },
+          now: ctx.now, appointments: ctx.appointments, addressOf: () => address,
+        });
+        // onlyIfConflict мог решить, что переносить нечего (конфликта нет) — без этой
+        // строки в notes человек видел бы пустой список без объяснения причины.
+        if (picked.skipped) notes.push(picked.skipped);
+        rejected = rejected.concat(picked.rejected.map((x) => ({ ...x, address })));
+        for (const slot of picked.ok) candidates.push({
+          slot, address, resourceId: r.id, complexResourceId: cr.id, name: r.name,
+          doctorName: isDoctor(t) ? (r.name || t.source.doctorName || null) : null,
+        });
+      }
+      if (!ctx.addressesOnly && (!ctx.active || ctx.active())) {
+        if (inBackoff() || reachedLimit) roomProgress.set(t, { source: t.source, range, checked, postponed });
+        else roomProgress.delete(t);
       }
       const compare = filters.slotComparator(t);
       candidates.sort((a, b) => compare(a.slot, b.slot));
       if (addressUnknown) notes.push(`Не удалось определить адрес ${addressUnknown} кабинет(ов) в расписании — пропущены`);
       if (addressMismatch) notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`);
       if (doctorUnknown) notes.push('ЕМИАС вернул расписание без подтверждения выбранного врача. Оно пропущено.');
-      if (pausedByBackoff) notes.push('ЕМИАС попросил паузу — часть кабинетов не проверена, продолжу на следующей проверке');
+      if (pausedByBackoff) notes.push('После паузы сначала проверю остальные кабинеты.');
+      if (reachedLimit) notes.push('Остальные кабинеты проверю в следующем цикле. Лимит запросов на этот цикл исчерпан.');
+      if (ctx.addressesOnly) return { candidates, rejected, notes, action, addresses: [...addresses.values()].sort((a, b) => a.localeCompare(b, 'ru')) };
       return { candidates, rejected, notes, action };
     }
 
     // Проверяем, что найденная в списке запись — действительно та, что мы только что
     // создали/перенесли, а не что-то постороннее, случайно совпавшее по времени:
     //  - время начала должно совпасть со слотом;
-    //  - адрес (кампус, без номера корпуса) должен совпасть с адресом кандидата;
+    //  - для выбора из списка адрес совпадает полностью с адресом слота.
+    //    В остальных режимах сравниваем кампус без номера корпуса;
     //  - для bookLab запись обязана получить НОВЫЙ id — ЕМИАС не присваивает новый id
     //    старой записи, поэтому id, уже бывший в списке ДО брони, не считается совпадением;
     //  - при переносе ЕМИАС выдаёт записи новый id, поэтому своей считаем запись с прежним
@@ -821,7 +972,9 @@ SOFTWARE.
     //    чужой перенесённый анализ/исследование с тем же временем).
     function matches(t, appt, cand, beforeIds) {
       if (toMs(appt.startTime) !== toMs(cand.slot.startTime)) return false;
-      if (campus(appt.lpuAddress) !== campus(cand.address)) return false;
+      const sameAddress = exactAddresses(t).length ? addressKey(appt.lpuAddress) === addressKey(cand.address)
+        : campus(appt.lpuAddress) === campus(cand.address);
+      if (!sameAddress) return false;
       if (t.scenario === 'bookLab') {
         if (beforeIds.has(String(appt.id))) return false;
         return !!appt.toBM && Number(appt.toBM.id) === Number(t.source.samplingTypeId);
@@ -894,7 +1047,7 @@ SOFTWARE.
           return doctorMismatch();
         }
       }
-      if (t.addressContains && !cand.address.toLowerCase().includes(t.addressContains.toLowerCase())) {
+      if (!matchesAddress(t, cand.address)) {
         return { ok: false, action: 'retry', message: 'Адрес больше не подходит.' };
       }
       const valid = filters.pickSlots({
@@ -910,6 +1063,7 @@ SOFTWARE.
 
     async function act(t, cand, ctx) {
       if (requiresDoctor(t) && !sameResource(cand.resourceId, t.source.availableResourceId)) return doctorMismatch();
+      if (!matchesAddress(t, cand.address)) return { ok: false, action: 'retry', message: 'Адрес больше не подходит.' };
       const send = (path, body) => api.post(path, body, ctx.canSend);
       const base = {
         availableResourceId: cand.resourceId, complexResourceId: cand.complexResourceId,
@@ -946,7 +1100,7 @@ SOFTWARE.
           // цель»). При сетевой ошибке (status 0), 429 или 5xx api уже выставил паузу перед
           // следующей попыткой — слать второй запрос сразу же значит обойти эту паузу.
           const isBusinessRejection = !res.ok && res.status >= 400 && res.status < 500 && res.status !== 429
-            && !(res.explained && res.explained.action === 'stopTarget');
+            && res.explained?.action !== 'stopTarget';
           if (isBusinessRejection && t.source.referralId) {
             res = await send('v4/saOrchestrator/shiftAppointment', { ...base, appointmentId: t.source.appointmentId, referralId: t.source.referralId });
           }
@@ -989,7 +1143,7 @@ SOFTWARE.
       return { ok: true, verified: true, message: 'Готово', newAppointment: verify.found, action: null };
     }
 
-    return { search, act, validateCandidate, listDoctors };
+    return { search, act, validateCandidate, listDoctors, listAddresses };
   }
 
   const api = { createTargets };
@@ -1005,6 +1159,8 @@ SOFTWARE.
 // детерминированными.
 (function (root) {
   'use strict';
+
+  const MAX_SEARCH_REQUESTS = 6;
 
   function hash(obj) {
     const s = JSON.stringify(obj);
@@ -1044,6 +1200,7 @@ SOFTWARE.
     let generation = 0;
     let offerSequence = 0;
     let booking = null;
+    let resumeAfterTarget = null;
     const isCurrent = (run) => state.running && run === generation
       && state.confirmed === gateFingerprint(state.list);
     const aborted = () => ({ ok: false, aborted: true, message: 'Запись больше не актуальна.' });
@@ -1060,6 +1217,7 @@ SOFTWARE.
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
       state.pending = {};
+      resumeAfterTarget = null;
       for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
@@ -1070,8 +1228,10 @@ SOFTWARE.
       if (wasRunning) emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
     }
 
-    async function appointments() {
-      const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
+    async function appointments(active) {
+      const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {}, active);
+      if (r.aborted) return null;
+      if (r.ok && r.status === 204 && r.json == null) return [];
       const list = r.json?.payload?.appointment;
       if (!r.ok || !Array.isArray(list) || list.some((a) => a?.id == null || typeof a.startTime !== 'string')) {
         throw new Error('Не удалось получить список записей ЕМИАС. Запись приостановлена до успешной проверки.');
@@ -1157,9 +1317,10 @@ SOFTWARE.
 
     async function dryRun() {
       const version = generation;
-      const appts = await appointments();
+      const appts = await appointments(() => version === generation);
       if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
       const items = [];
+      const budget = { remaining: MAX_SEARCH_REQUESTS };
       for (const t of state.list) {
         const existing = existingAppointment(t, appts);
         if (existing) {
@@ -1170,7 +1331,7 @@ SOFTWARE.
         }
         let r;
         try {
-          r = await targets.search(t, { now: now(), appointments: appts, active: () => version === generation });
+          r = await targets.search(t, { now: now(), appointments: appts, budget, active: () => version === generation });
         } catch (e) {
           // Холостой прогон не должен падать целиком из-за одной сбойной
           // цели — иначе человек не увидит отчёт по остальным целям и не
@@ -1235,7 +1396,8 @@ SOFTWARE.
       // джиттера не должна увести фактическую задержку ниже 30 секунд.
       const jittered = Math.round(base * (0.8 + Math.random() * 0.4));
       const run = generation;
-      timer.schedule(Math.max(config.minIntervalMs, jittered), () => {
+      const delay = Math.max(config.minIntervalMs, jittered, api.backoffUntil() - now());
+      timer.schedule(Math.min(delay, 2147483647), () => {
         if (run === generation) return tick();
       });
     }
@@ -1258,8 +1420,8 @@ SOFTWARE.
         try { session.assertContext?.(scope); return true; }
         catch (e) { return false; }
       };
-      const appts = await appointments();
-      if (!canSend()) return aborted();
+      const appts = await appointments(canSend);
+      if (!appts || !canSend()) return aborted();
       if (existingAppointment(t, appts)) {
         adoptExisting(t, appts);
         return { ok: false, message: 'По этому направлению уже есть запись. Проверьте её в ЕМИАС.' };
@@ -1381,27 +1543,33 @@ SOFTWARE.
       // больше, чем должно быть по расписанию, — это не «мы решили не
       // проверять», а комп/браузер были неактивны.
       const gap = now() - state.lastTickAt;
-      if (state.lastTickAt && gap > interval() * config.sleepFactor) {
+      const expected = Math.max(interval(), api.backoffUntil() - state.lastTickAt);
+      if (state.lastTickAt && gap > expected * config.sleepFactor) {
         emit('slept', { from: state.lastTickAt, to: now(), missed: Math.round(gap / interval()) });
       }
       state.lastTickAt = now();
-      state.lastCheckAt = now();
 
       try {
         session.assertContext?.();
         if (now() >= api.backoffUntil()) {
-          const appts = await appointments();
-          if (!active()) return;
+          state.lastCheckAt = now();
+          const appts = await appointments(active);
+          if (!appts || !active()) return;
           // Ошибки запросов расписания не засчитываем как успешную проверку.
           let searchOk = true;
+          const budget = { remaining: MAX_SEARCH_REQUESTS };
+          const next = state.list.findIndex((t) => t.id === resumeAfterTarget) + 1;
+          const order = [...state.list.slice(next), ...state.list.slice(0, next)];
+          resumeAfterTarget = null;
           targetsLoop:
-          for (const t of state.list) {
+          for (const t of order) {
             // C2: backoffUntil проверяли только один раз в начале tick() (выше) — но
             // targets.search() сам может нарваться на 429 ПОСЕРЕДИНЕ этого перебора
             // (например, у первой цели), и тогда без этой проверки раннер всё равно
             // продолжил бы дёргать ЕМИАС по остальным целям в том же тике.
             if (!active()) return;
             if (now() < api.backoffUntil()) { searchOk = false; break targetsLoop; }
+            if (!budget.remaining) break targetsLoop;
             const st = state.byId[t.id];
             // 'improving' — цель уже выполнена один раз, но keepImproving
             // просит продолжать искать более удобный слот, поэтому такую
@@ -1424,9 +1592,11 @@ SOFTWARE.
               continue;
             }
 
-            const r = await targets.search(t, { now: now(), appointments: appts, active });
+            const r = await targets.search(t, { now: now(), appointments: appts, active, reuseResources: true, budget });
             if (!active()) return;
-            if (r.action === 'wait' || r.action === 'retry') searchOk = false;
+            const paused = now() < api.backoffUntil();
+            if (paused || !budget.remaining) resumeAfterTarget = t.id;
+            if (paused || r.action === 'wait' || r.action === 'retry') searchOk = false;
 
             if (r.action === 'stopTarget') {
               const message = (r.notes && r.notes.join('; ')) || 'цель остановлена';
@@ -1443,8 +1613,10 @@ SOFTWARE.
               return;
             }
 
-            if (!r.candidates.length) {
-              if (r.notes && r.notes.length) log(`${t.title}: ${r.notes.join('; ')}`);
+            if (paused || !r.candidates.length) {
+              const note = (r.notes && r.notes.length) ? r.notes.join('; ')
+                : !paused && r.rejected.length ? 'Расписание получено, подходящих по условиям слотов нет.' : '';
+              if (note) log(`${t.title}: ${note}`);
               continue;
             }
 
@@ -1462,6 +1634,10 @@ SOFTWARE.
 
             const res = await finish(t, cand, run);
             if (!active() || res.action === 'relogin') return;
+            if (now() < api.backoffUntil()) {
+              resumeAfterTarget = t.id;
+              searchOk = false;
+            }
           }
           if (searchOk && now() >= api.backoffUntil()) {
             state.lastOkAt = now();
@@ -1477,7 +1653,7 @@ SOFTWARE.
       // Протухание: считаем от старта/последней удавшейся проверки. Как
       // только разрыв достиг трёх интервалов — сообщаем один раз и молчим
       // до следующей удачной проверки (staleNotified сбрасывается выше).
-      if (now() - state.lastOkAt >= interval() * config.staleFactor && !state.staleNotified) {
+      if (now() >= api.backoffUntil() && now() - state.lastOkAt >= interval() * config.staleFactor && !state.staleNotified) {
         state.staleNotified = true;
         emit('stale', { since: state.lastOkAt });
       }
@@ -1497,6 +1673,7 @@ SOFTWARE.
         lastTickAt: state.lastTickAt,
         lastCheckAt: state.lastCheckAt,
         lastOkAt: state.lastOkAt,
+        pausedUntil: api.backoffUntil(),
         sessionRefreshedAt: session.refreshedAt,
         targets: state.list.map((t) => ({ id: t.id, title: t.title, current: t.current || null, ...state.byId[t.id] })),
         pending: Object.keys(state.pending),
@@ -1630,7 +1807,7 @@ SOFTWARE.
     };
   }
 
-  function create({ storage, fetch, now = Date.now, timer, channel = null, config = {}, modules, instanceId } = {}) {
+  function create({ storage, fetch, now = Date.now, timer, wait, channel = null, config = {}, modules, instanceId } = {}) {
     const M = modules || root.EmiasCore;
     if (!M) {
       throw new Error('core/index.js: не переданы модули ядра (modules) и globalThis.EmiasCore недоступен');
@@ -1641,7 +1818,7 @@ SOFTWARE.
     const filters = M.createFilters(util);
     const timedFetch = M.createTimedFetch(fetch, config.requestTimeoutMs);
     const session = M.createSession({ storage, fetch: timedFetch, now });
-    const api = M.createApi({ session, errors, fetch: timedFetch, now });
+    const api = M.createApi({ session, errors, fetch: timedFetch, now, wait });
     const discover = M.createDiscover({ api, today: () => util.mskDate(new Date(now())) });
     const targets = M.createTargets({ api, filters, util });
 
@@ -1764,6 +1941,7 @@ SOFTWARE.
       },
       discover: () => discover.list(),
       listDoctors: (option) => targets.listDoctors(option),
+      listAddresses: (target, active) => targets.listAddresses(target, { now: now(), active }),
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),
@@ -1817,6 +1995,7 @@ SOFTWARE.
     };
     const stripCampus = (addr) => String(addr || '').replace(/,\s*к\.\s*\d+.*$/i, '').trim();
     const dayHuman = (ymd) => { const d = String(ymd).split('-'); return `${Number(d[2])} ${MONTHS[Number(d[1]) - 1]}`; };
+    const hasCurrentAddress = (option) => !!(option.current && typeof option.address === 'string' && option.address.trim());
 
     function buildTarget(option, form) {
       // form.when — три взаимоисключающих варианта:
@@ -1839,7 +2018,7 @@ SOFTWARE.
       const deadline = option.deadline || null;
       // Искать за пределами срока действия направления бессмысленно — если человек
       // задал dateTo позже deadline (или deadline вообще не знал), обрезаем по deadline.
-      const dateTo = !form.dateTo ? null : (deadline && deadline < form.dateTo ? deadline : form.dateTo);
+      const dateTo = onlyDay || !form.dateTo ? null : (deadline && deadline < form.dateTo ? deadline : form.dateTo);
       const sameDoctor = option.scenario === 'shiftDoctor' && form.sameDoctor === true;
       const source = sameDoctor && !option.source.availableResourceId && form.doctor
         ? { ...option.source, availableResourceId: form.doctor.id, doctorName: form.doctor.name }
@@ -1851,13 +2030,14 @@ SOFTWARE.
         current: option.current || null,
         onlyDay,
         anyTime,
-        dateFrom: form.dateFrom || null,
+        dateFrom: !onlyDay && form.dateFrom ? form.dateFrom : null,
         dateTo,
         deadline,
         timeFrom: form.timeFrom || null,
         timeTo: form.timeTo || null,
-        addressContains: form.where === 'sameCampus' ? stripCampus(option.address)
-          : form.where === 'contains' ? (form.addressContains || null) : null,
+        addressContains: form.where === 'sameCampus' && hasCurrentAddress(option) ? stripCampus(option.address)
+          : form.where === 'contains' ? (form.addressContains?.trim() || null) : null,
+        exactAddresses: form.where === 'choose' ? [...new Set(form.selectedAddresses || [])] : [],
         prefer: form.preferUntil ? { until: form.preferUntil, timeTo: form.preferTimeTo || null } : null,
         near: form.nearStart && form.nearEnd ? { start: form.nearStart, end: form.nearEnd } : null,
         respectTravel: form.respectTravel !== false,
@@ -1880,7 +2060,7 @@ SOFTWARE.
     function describeTarget(t) {
       const parts = [];
       if (t.near) parts.push(`подгоняю ближе к ${human(t.near.start)}–${String(t.near.end).slice(11, 16)}`);
-      else if (t.onlyDay && t.anyTime) parts.push(`любое время ${dayHuman(t.onlyDay)}`);
+      else if (t.onlyDay && t.anyTime) parts.push(`только ${dayHuman(t.onlyDay)}`);
       else if (t.onlyDay && t.current) parts.push(`${dayHuman(t.onlyDay)}, раньше ${human(t.current)}`);
       else if (t.onlyDay) parts.push(`только ${dayHuman(t.onlyDay)}`);
       else if (t.current) parts.push(`раньше ${human(t.current)}`);
@@ -1898,7 +2078,10 @@ SOFTWARE.
       }
 
       if (t.timeFrom || t.timeTo) parts.push(`время с ${t.timeFrom || '00:00'} до ${t.timeTo || '23:59'}`);
-      if (t.addressContains) parts.push(`адрес: ${t.addressContains}`);
+      const addresses = t.exactAddresses?.length ? t.exactAddresses : t.addressExact ? [t.addressExact] : [];
+      if (addresses.length) parts.push(addresses.length === 1 ? `точный адрес — ${addresses[0]}`
+        : `любой из выбранных адресов — ${addresses.join(' · ')}`);
+      else if (t.addressContains) parts.push(`адрес содержит «${t.addressContains}»`);
       if (t.scenario === 'shiftDoctor') {
         const doctor = t.source?.doctorName || 'врач из текущей записи';
         parts.push(t.sameDoctor ? `только ${doctor}` : 'любой врач из предложенных ЕМИАС');
@@ -1909,7 +2092,7 @@ SOFTWARE.
         parts.push(preferText);
       }
       if (t.purpose) parts.push(`цель визита: ${purposeTitle(t.purpose)}`);
-      if (t.respectTravel) parts.push('с запасом на дорогу');
+      if (t.respectTravel) parts.push('час на дорогу между адресами');
       parts.push(t.mode === 'confirm' ? 'спрашиваю перед записью' : 'записываю сразу');
       parts.push(t.keepImproving ? 'продолжаю искать после успеха' : 'останавливаюсь после первого успеха');
 
@@ -1917,8 +2100,11 @@ SOFTWARE.
       // отдельная формулировка «Запишу к <специальность> / на <исследование> по
       // направлению до <дата>» вместо общего «<title>: …» — дата уже учтена в head.
       if (byReferral) {
-        const last = t.dateTo || t.deadline || null;
-        const head = `Запишу ${t.scenario === 'bookLdp' ? 'на' : 'к'} ${t.title} по направлению` + (last ? ` до ${dayHuman(last)}` : '');
+        const last = t.onlyDay ? null : t.dateTo || t.deadline;
+        const first = t.onlyDay ? null : t.dateFrom;
+        const range = first ? ` с ${dayHuman(first)}` + (last ? ` по ${dayHuman(last)}` : '')
+          : last ? ` до ${dayHuman(last)}` : '';
+        const head = `Запишу ${t.scenario === 'bookLdp' ? 'на' : 'к'} ${t.title} по направлению` + range;
         return parts.length ? `${head}, ${parts.join(', ')}` : head;
       }
 
@@ -1950,7 +2136,7 @@ SOFTWARE.
     }
 
     return {
-      buildTarget, describeTarget, describeDryRunItem, saveConfig, loadConfig, applyBookedUpdate, human, stripCampus, KEY,
+      buildTarget, describeTarget, describeDryRunItem, saveConfig, loadConfig, applyBookedUpdate, human, stripCampus, hasCurrentAddress, KEY,
       INQUIRY_PURPOSES,
     };
   }
@@ -2166,7 +2352,7 @@ SOFTWARE.
       .esh-badge.k-paused { background: #8a6d3b; }
       .esh-badge.k-needLogin, .esh-badge.k-needIdentity, .esh-badge.k-sessionLost, .esh-badge.k-stale, .esh-badge.k-resumeError, .esh-badge.k-needDryRun { background: #d64545; }
       .esh-sub { display: block; font-size: 11px; opacity: .85; font-weight: normal; }
-      .esh-card { width: 320px; max-width: calc(100vw - 32px); box-sizing: border-box; max-height: 70vh; overflow: auto; background: #fff; color: #222; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,.3); padding: 14px; }
+      .esh-card { width: 420px; max-width: calc(100vw - 32px); box-sizing: border-box; max-height: 75vh; overflow: auto; background: #fff; color: #222; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,.3); padding: 14px; }
       .esh-card h3 { margin: 0 0 8px; font-size: 16px; }
       .esh-card p { margin: 4px 0; font-size: 13px; line-height: 1.4; }
       .esh-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
@@ -2175,8 +2361,18 @@ SOFTWARE.
       .esh-opt .title { font-weight: 600; font-size: 13px; }
       .esh-opt .meta { font-size: 12px; color: #666; }
       .esh-opt .reason { font-size: 12px; color: #a33; }
-      .esh-field { display: block; font-size: 12px; margin: 6px 0 2px; color: #444; }
-      .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time] { width: 100%; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; }
+      .esh-field { display: block; min-width: 0; font-size: 12px; margin: 4px 0 2px; color: #444; }
+      .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time], .esh-card select { width: 100%; min-width: 0; min-height: 34px; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; background: #fff; color: #222; }
+      .esh-section { min-width: 0; border: 0; border-top: 1px solid #e8eaed; margin: 12px 0 0; padding: 6px 0 0; }
+      .esh-section legend { padding: 0 6px 0 0; font-size: 13px; font-weight: 600; }
+      .esh-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 10px; }
+      .esh-addresses { min-width: 0; margin: 8px 0 2px; padding: 0; border: 0; font-size: 13px; }
+      .esh-address-list { max-height: 172px; overflow: auto; padding: 2px 4px; }
+      .esh-address-list .esh-row { margin: 0; padding: 5px 0; cursor: pointer; }
+      .esh-address-list input { flex: none; }
+      .esh-card button.esh-load { margin-top: 6px; }
+      .esh-card .esh-example { color: #535a64; }
+      @media (max-width: 335px) { .esh-grid { grid-template-columns: minmax(0, 1fr); } }
       .esh-btns { display: flex; gap: 8px; margin-top: 12px; }
       .esh-btn { flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; background: #f4f4f4; cursor: pointer; font-size: 13px; }
       .esh-btn.primary { background: #2e7dd7; color: #fff; border-color: #2e7dd7; }
@@ -2196,7 +2392,6 @@ SOFTWARE.
       .esh-slept[hidden] { display: none; }
       .esh-log { font-size: 12px; max-height: 160px; overflow: auto; background: #fafafa; border: 1px solid #eee; border-radius: 6px; padding: 6px; }
       .esh-log div { margin-bottom: 4px; }
-      details.esh-more summary { cursor: pointer; font-size: 12px; color: #2e7dd7; margin-top: 6px; }
     `;
   }
 
@@ -2414,6 +2609,7 @@ SOFTWARE.
 
   function describeOptionMeta(option) {
     const parts = [];
+    if (!option.current) parts.push('новая запись по направлению');
     if (option.source?.doctorName) parts.push(option.source.doctorName);
     if (option.current) parts.push('сейчас записано на ' + ui.human(option.current));
     if (option.address) parts.push(ui.stripCampus(option.address));
@@ -2441,10 +2637,9 @@ SOFTWARE.
   function ensureForm(option) {
     if (!wizard.forms[option.id]) {
       wizard.forms[option.id] = {
-        // Для новой записи 'earlier' показывается как «как можно раньше».
         when: 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
-        where: option.address ? 'sameCampus' : 'any', addressContains: '',
+        where: ui.hasCurrentAddress(option) ? 'sameCampus' : 'any', addressContains: '', selectedAddresses: [],
         respectTravel: true, mode: 'confirm', purpose: 'unwell', keepImproving: false, sameDoctor: false,
       };
     }
@@ -2522,52 +2717,111 @@ SOFTWARE.
     return h('div', {}, [h('label', { class: 'esh-field', text: 'Цель визита' }), group]);
   }
 
-  function whenField(option, form, update, quiet) {
-    const opts = [
-      ['earlier', option.current ? 'раньше, чем сейчас записано' : 'как можно раньше'],
-      ...(option.current ? [['sameDayEarlier', 'в тот же день, но раньше']] : []),
-      ['onlyDay', 'в выбранный день, в любое время'],
-    ];
-    const group = h('div', {}, opts.map(([val, text]) => h('label', { class: 'esh-row' }, [
-      h('input', { type: 'radio', name: 'when-' + option.id, checked: form.when === val, onchange: () => update({ when: val }) }),
-      h('span', { text }),
-    ])));
-    const dayInput = form.when === 'onlyDay' ? h('input', {
-      type: 'date', value: form.day, onchange: (e) => quiet({ day: e.target.value }),
-    }) : null;
-    return h('div', {}, [group, dayInput]);
+  function selectField(label, value, choices, change) {
+    return h('label', { class: 'esh-field' }, [
+      label, h('select', { 'aria-label': label, onchange: (e) => change(e.target.value) },
+        choices.map(([id, text]) => h('option', { value: id, text, selected: id === value }))),
+    ]);
+  }
+
+  function dateAndTimeFields(option, form, update, quiet) {
+    const days = option.current
+      ? [['earlier', 'Раньше текущей записи'], ['sameDayEarlier', 'В тот же день, но раньше'], ['onlyDay', 'На выбранную дату']]
+      : [['earlier', 'Диапазон дат'], ['onlyDay', 'Одна дата']];
+    const input = (label, type, key) => h('label', { class: 'esh-field' }, [
+      label, h('input', { type, value: form[key], onchange: (e) => quiet({ [key]: e.target.value }) }),
+    ]);
+    let dates;
+    if (form.when === 'onlyDay') dates = input('Дата приёма', 'date', 'day');
+    else if (form.when === 'sameDayEarlier') dates = h('p', { class: 'esh-note', text: `Текущий приём — ${ui.human(option.current)}.` });
+    else dates = h('div', { class: 'esh-grid' }, [
+      input('Дата с', 'date', 'dateFrom'), input('Дата по', 'date', 'dateTo'),
+    ]);
+    return h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Дата и время' }),
+      selectField(option.current ? 'Когда перенести' : 'Дни поиска', form.when, days, (when) => update({ when })),
+      dates,
+      option.current && form.when === 'onlyDay' ? h('p', { class: 'esh-note', text: 'Можно выбрать дату позже текущей записи.' }) : null,
+      h('div', { class: 'esh-grid' }, [
+        input('Время с (МСК)', 'time', 'timeFrom'), input('Время по (МСК)', 'time', 'timeTo'),
+      ]),
+      h('p', { class: 'esh-note', text: 'Время — начало приёма. Если оставить время пустым, подойдут все часы.' }),
+    ]);
   }
 
   function whereField(option, form, update, quiet) {
-    const opts = [
-      ...(option.address ? [['sameCampus', 'по этому же адресу (любой корпус)']] : []),
-      ['any', 'где угодно'],
-      ['contains', 'адрес содержит:'],
+    const choices = [
+      ...(ui.hasCurrentAddress(option) ? [['sameCampus', 'Адрес текущей записи']] : []),
+      ['any', 'Любой адрес из ЕМИАС'],
+      ['choose', 'Выбрать адреса из списка'],
+      ['contains', 'Указать часть адреса'],
     ];
-    const group = h('div', {}, opts.map(([val, text]) => h('label', { class: 'esh-row' }, [
-      h('input', { type: 'radio', name: 'where-' + option.id, checked: form.where === val, onchange: () => update({ where: val }) }),
-      h('span', { text }),
-    ])));
-    const addrInput = form.where === 'contains' ? h('input', {
-      type: 'text', value: form.addressContains, placeholder: 'например, Ленина',
-      oninput: (e) => quiet({ addressContains: e.target.value }),
-    }) : null;
-    return h('div', {}, [group, addrInput]);
+    const field = h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Место приёма' }),
+      selectField('Где искать', form.where, choices, (where) => update({ where })),
+    ]);
+    if (form.where === 'sameCampus') {
+      field.appendChild(h('p', { class: 'esh-note', text: `Подойдут корпуса по адресу ${ui.stripCampus(option.address)}.` }));
+    } else if (form.where === 'contains') {
+      field.appendChild(h('label', { class: 'esh-field' }, ['Часть адреса', h('input', {
+        type: 'text', value: form.addressContains, placeholder: 'Улица или дом',
+        oninput: (e) => quiet({ addressContains: e.target.value }),
+      })]));
+    } else if (form.where === 'choose') {
+      if (form.addresses?.length) {
+        const choices = form.addresses.map((address) => h('label', { class: 'esh-row' }, [
+          h('input', {
+            type: 'checkbox', value: address, checked: form.selectedAddresses.includes(address),
+            onchange: (event) => {
+              const selected = form.selectedAddresses.filter((entry) => entry !== address);
+              if (event.target.checked) selected.push(address);
+              quiet({ selectedAddresses: selected });
+            },
+          }),
+          h('span', { text: address }),
+        ]));
+        field.appendChild(h('fieldset', { class: 'esh-addresses' }, [
+          h('legend', { text: 'Отметьте подходящие адреса' }),
+          h('div', { class: 'esh-address-list' }, choices),
+        ]));
+      } else if (form.addresses) {
+        field.appendChild(h('p', { class: 'esh-note', text: 'ЕМИАС пока не предложил адреса для этих условий. Можно указать часть адреса.' }));
+      }
+      if (form.addressNotice) field.appendChild(h('p', { class: 'esh-note', text: form.addressNotice }));
+      if (form.addressError) field.appendChild(h('p', { class: 'esh-warn', text: form.addressError, role: 'status' }));
+      field.appendChild(h('button', {
+        class: 'esh-btn esh-load', disabled: !!form.loadingAddresses,
+        text: form.loadingAddresses ? 'Загружаю адреса…' : form.addresses ? 'Обновить список адресов' : 'Загрузить адреса из ЕМИАС',
+        onclick: () => loadAddresses(option, form, update),
+      }));
+    }
+    return field;
   }
 
-  function advancedFields(form, quiet) {
-    const field = (label, type, key) => h('label', { class: 'esh-field' }, [
-      label, h('input', { type, value: form[key], onchange: (e) => quiet({ [key]: e.target.value }) }),
-    ]);
-    // Раскрыт ли блок, помним в форме: шаг перерисовывается при выборе любого
-    // переключателя, и без этого блок каждый раз схлопывался заново.
-    return h('details', { class: 'esh-more', open: !!form.moreOpen, ontoggle: (e) => { form.moreOpen = e.target.open; } }, [
-      h('summary', { text: 'Дополнительно: даты и время' }),
-      field('Не раньше какого дня', 'date', 'dateFrom'),
-      field('Не позже какого дня', 'date', 'dateTo'),
-      field('Время не раньше', 'time', 'timeFrom'),
-      field('Время не позже', 'time', 'timeTo'),
-    ]);
+  async function loadAddresses(option, form, update) {
+    if (form.loadingAddresses) return;
+    const error = dateOrDoctorError(option, form);
+    if (error) { update({ addressError: error }); return; }
+    const generation = wizardGeneration;
+    const target = ui.buildTarget(option, form);
+    update({ loadingAddresses: true, addressError: '', addressNotice: '' });
+    const visible = () => generation === wizardGeneration && wizard.open && wizard.step === 2;
+    const active = () => visible() && form.where === 'choose';
+    try {
+      const { addresses, notice } = await core.listAddresses(target, active);
+      if (active()) {
+        const selectedAddresses = form.selectedAddresses.filter((address) => addresses.includes(address));
+        const removed = selectedAddresses.length < form.selectedAddresses.length;
+        const addressNotice = [notice, removed ? 'Часть отмеченных адресов исчезла из списка ЕМИАС. Проверьте выбор.' : ''].filter(Boolean).join(' ');
+        update({ addresses, selectedAddresses, addressNotice, loadingAddresses: false });
+      }
+    } catch (error) {
+      if (!active()) return;
+      if (error.name === 'SessionError') { onSessionLost(error); return; }
+      update({ addressError: error.message, loadingAddresses: false });
+    } finally {
+      form.loadingAddresses = false;
+    }
   }
 
   function renderTargetCard(option) {
@@ -2580,27 +2834,30 @@ SOFTWARE.
     const quiet = (patch) => { Object.assign(form, patch); refreshStepTwoState(); };
     const card = h('div', { class: 'esh-opt' });
     card.appendChild(h('div', { class: 'title', text: option.title }));
+    card.appendChild(h('div', { class: 'meta', text: describeOptionMeta(option) }));
     const doctor = doctorField(option, form, update);
     if (doctor) card.appendChild(doctor);
-    card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
-    card.appendChild(whenField(option, form, update, quiet));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
-    card.appendChild(whereField(option, form, update, quiet));
     const purpose = purposeField(option, form, update);
     if (purpose) card.appendChild(purpose);
-    card.appendChild(h('label', { class: 'esh-row' }, [
-      h('input', { type: 'checkbox', checked: form.respectTravel, onchange: (e) => update({ respectTravel: e.target.checked }) }),
-      h('span', { text: 'Учитывать время на дорогу между записями' }),
+    card.appendChild(dateAndTimeFields(option, form, update, quiet));
+    card.appendChild(whereField(option, form, update, quiet));
+    card.appendChild(h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Другие приёмы в тот же день' }),
+      h('label', { class: 'esh-row' }, [
+        h('input', { type: 'checkbox', checked: form.respectTravel, onchange: (e) => quiet({ respectTravel: e.target.checked }) }),
+        h('span', { text: 'Оставлять час на дорогу между адресами' }),
+      ]),
+      h('p', { class: 'esh-note esh-example', text: 'Если приём по другому адресу заканчивается в 09:00, новый слот подойдёт с 10:00. Пересекающиеся приёмы пропускаются всегда.' }),
     ]));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Как записывать' }));
-    card.appendChild(h('div', {}, [
+    card.appendChild(h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Когда найден слот' }),
       h('label', { class: 'esh-row' }, [
         h('input', { type: 'radio', name: 'mode-' + option.id, checked: form.mode === 'auto', onchange: () => update({ mode: 'auto' }) }),
-        h('span', { text: 'сразу, без вопросов' }),
+        h('span', { text: option.current ? 'Перенести сразу' : 'Записать сразу' }),
       ]),
       h('label', { class: 'esh-row' }, [
         h('input', { type: 'radio', name: 'mode-' + option.id, checked: form.mode === 'confirm', onchange: () => update({ mode: 'confirm' }) }),
-        h('span', { text: 'сначала спрашивать' }),
+        h('span', { text: option.current ? 'Спросить перед переносом' : 'Спросить перед записью' }),
       ]),
     ]));
     if (form.when !== 'onlyDay') {
@@ -2609,7 +2866,6 @@ SOFTWARE.
         h('span', { text: 'Продолжать искать более ранний слот после успеха' }),
       ]));
     }
-    card.appendChild(advancedFields(form, quiet));
     const error = stepTwoError(option, form);
     const errorEl = h('p', { class: 'esh-warn', text: error || '', hidden: !error });
     errorEl.dataset.optionId = option.id;
@@ -2617,12 +2873,22 @@ SOFTWARE.
     return card;
   }
 
+  function dateOrDoctorError(option, form) {
+    if (option.scenario === 'shiftDoctor' && form.sameDoctor && !option.source.availableResourceId && !form.doctor) return 'Выберите врача для переноса.';
+    if (form.when === 'onlyDay' && !form.day) return 'Выберите дату приёма.';
+    if (form.when === 'onlyDay' && option.deadline && form.day > option.deadline.slice(0, 10)) return 'Эта дата позже срока направления.';
+    if (form.when === 'earlier' && form.dateFrom && form.dateTo && form.dateFrom > form.dateTo) return 'Дата «по» не может быть раньше даты «с».';
+    if (form.when === 'earlier' && option.deadline && form.dateFrom > option.deadline.slice(0, 10)) return 'Начало поиска позже срока направления.';
+    if (form.when === 'earlier' && option.current && form.dateFrom > option.current.slice(0, 10)) return 'Начальная дата уже позже текущей записи. Измените дату или режим переноса.';
+    if (form.timeFrom && form.timeTo && form.timeFrom > form.timeTo) return 'Время «по» не может быть раньше времени «с».';
+    return null;
+  }
+
   function stepTwoError(option, form) {
-    if (option.scenario === 'shiftDoctor' && form.sameDoctor && !option.source.availableResourceId && !form.doctor) return 'выберите врача для переноса';
-    if (form.when === 'onlyDay' && !form.day) return 'выберите день';
-    if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
-    if (form.dateFrom && form.dateTo && form.dateFrom > form.dateTo) return 'проверьте порядок дат';
-    if (form.timeFrom && form.timeTo && form.timeFrom > form.timeTo) return 'проверьте порядок времени';
+    const error = dateOrDoctorError(option, form);
+    if (error) return error;
+    if (form.where === 'contains' && !form.addressContains.trim()) return 'Укажите часть адреса.';
+    if (form.where === 'choose' && !form.selectedAddresses.length) return 'Отметьте хотя бы один адрес или измените условие места.';
     return null;
   }
 
@@ -2638,6 +2904,7 @@ SOFTWARE.
   }
 
   function renderStep2(selected) {
+    const scrollTop = dom.panel.scrollTop;
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: 'Шаг 2 из 3. Условия поиска' }));
     dom.panel.appendChild(h('div', {}, selected.map(renderTargetCard)));
@@ -2646,6 +2913,7 @@ SOFTWARE.
     const next = h('button', { class: 'esh-btn primary', text: 'Далее', disabled: hasErrors, onclick: () => openWizard(3) });
     next.dataset.role = 'step2-next';
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back, next]));
+    dom.panel.scrollTop = scrollTop;
   }
 
   // Обновляет ошибки карточек и кнопку «Далее» на шаге 2 без перерисовки.
@@ -2924,8 +3192,11 @@ SOFTWARE.
   function runningDetail() {
     if (badgeNote && Date.now() < badgeNote.until) return badgeNote.text;
     badgeNote = null;
-    const t = core.status().lastCheckAt;
-    return t ? 'проверено в ' + hhmm(t) : 'ожидаю первую проверку';
+    const status = core.status();
+    if (Date.now() < status.pausedUntil) {
+      return 'пауза ЕМИАС · ещё ' + Math.ceil((status.pausedUntil - Date.now()) / 1000) + ' с';
+    }
+    return status.lastCheckAt ? 'проверено в ' + hhmm(status.lastCheckAt) : 'ожидаю первую проверку';
   }
 
   /* ==================== события ядра ==================== */
@@ -3056,7 +3327,7 @@ SOFTWARE.
       if (!status.running) return;
       try { core.checkSession(); }
       catch (e) { onSessionLost({ message: e.message }); return; }
-      if (Date.now() - status.lastOkAt > 90000) onStale({ since: status.lastOkAt });
+      if (Date.now() >= status.pausedUntil && Date.now() - status.lastOkAt > 90000) onStale({ since: status.lastOkAt });
       else if (badgeState.kind !== 'booked') setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
       if (panelMode === 'status') renderStatusPanel();
     }, 5000);
@@ -3073,7 +3344,8 @@ SOFTWARE.
     const timer = createWorkerTimer();
     let channel = null;
     try { channel = new BroadcastChannel('emias-slot-hunter'); } catch (e) { channel = null; }
-    core = create({ storage: siteStorage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, channel });
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    core = create({ storage: siteStorage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, wait, channel });
     subscribeCore();
     setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
   }

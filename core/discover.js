@@ -73,8 +73,9 @@
       // Направления без активной записи: к врачу (toDoctor) — цель bookDoctor,
       // на исследование (toLdp) — bookLdp. Запросы bookLdp взяты по аналогии с
       // bookDoctor и на живом сайте ещё не сняты.
+      const bookedReferrals = new Set(out.filter((o) => o.source.referralId != null).map((o) => String(o.source.referralId)));
       for (const ref of (ar.referrals && ar.referrals.items) || []) {
-        if (ref.countActiveAppointment > 0) continue;
+        if (ref.countActiveAppointment > 0 || bookedReferrals.has(String(ref.id))) continue;
         if (expired(ref.endTime)) continue;
         if (ref.toDoctor) {
           const title = ref.toDoctor.specialityName + (ref.toDoctor.doctorFio ? ' — ' + ref.toDoctor.doctorFio : '');

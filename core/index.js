@@ -104,7 +104,7 @@
     };
   }
 
-  function create({ storage, fetch, now = Date.now, timer, channel = null, config = {}, modules, instanceId } = {}) {
+  function create({ storage, fetch, now = Date.now, timer, wait, channel = null, config = {}, modules, instanceId } = {}) {
     const M = modules || root.EmiasCore;
     if (!M) {
       throw new Error('core/index.js: не переданы модули ядра (modules) и globalThis.EmiasCore недоступен');
@@ -115,7 +115,7 @@
     const filters = M.createFilters(util);
     const timedFetch = M.createTimedFetch(fetch, config.requestTimeoutMs);
     const session = M.createSession({ storage, fetch: timedFetch, now });
-    const api = M.createApi({ session, errors, fetch: timedFetch, now });
+    const api = M.createApi({ session, errors, fetch: timedFetch, now, wait });
     const discover = M.createDiscover({ api, today: () => util.mskDate(new Date(now())) });
     const targets = M.createTargets({ api, filters, util });
 
@@ -238,6 +238,7 @@
       },
       discover: () => discover.list(),
       listDoctors: (option) => targets.listDoctors(option),
+      listAddresses: (target, active) => targets.listAddresses(target, { now: now(), active }),
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),

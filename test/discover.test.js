@@ -54,7 +54,13 @@ test('направление на исследование (toLdp) без зап
 });
 
 test('направление к врачу без записи (needPurpose: true) становится целью bookDoctor', async () => {
-  const list = await createDiscover({ api }).list();
+  const withoutDoctor = appointments.payload.appointment.filter((a) => !a.toDoctor);
+  const noDoctorBooking = {
+    post: (path) => path.includes('getAppointmentReceptionsByPatient')
+      ? Promise.resolve({ ok: true, json: { payload: { appointment: withoutDoctor } } })
+      : api.post(path),
+  };
+  const list = await createDiscover({ api: noDoctorBooking }).list();
   const ref = list.find((o) => o.id === 'ref:900000000002');
   assert.equal(ref.scenario, 'bookDoctor');
   assert.equal(ref.title, 'Врач-эндокринолог');
@@ -66,6 +72,13 @@ test('направление к врачу без записи (needPurpose: tru
   assert.deepEqual(ref.source, {
     referralId: 900000000002, lpuId: 10000003, specialityId: 10, needPurpose: true, availableResourceId: null,
   });
+});
+
+test('фактическая запись по направлению оставляет только перенос при устаревшем счётчике', async () => {
+  const list = await createDiscover({ api }).list();
+  assert.equal(referrals.payload.arInfo.referrals.items.find((ref) => ref.id === 900000000002).countActiveAppointment, 0);
+  assert.ok(list.some((option) => option.scenario === 'shiftDoctor' && option.source.referralId === 900000000002));
+  assert.ok(!list.some((option) => option.id === 'ref:900000000002'));
 });
 
 test('направление к конкретному врачу без записи (needPurpose: false, availableResourceId) становится целью bookDoctor с ФИО в названии', async () => {

@@ -95,3 +95,12 @@ test('SA_APPOINTMENT_CANNOT_BE_CANCELED останавливает цель по
   assert.match(r.message, /не даёт перенести/);
   assert.doesNotMatch(r.message, /Непонятный/);
 });
+
+test('SA_REFERRAL_FOR_FUTURE без корректной даты не планирует повтор', () => {
+  for (const description of [undefined, 'Запись по этому направлению будет доступна с 2026-02-30', 'Пациент неизвестен']) {
+    const result = e.explain({ status: 400, code: 'SA_REFERRAL_FOR_FUTURE', description });
+    assert.equal(result.action, 'stopTarget');
+    assert.equal(result.earliestDay, null);
+    assert.match(result.message, /Проверьте его на сайте/);
+  }
+});

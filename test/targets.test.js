@@ -54,6 +54,37 @@ test('фильтр по адресу отбрасывает чужие каби�
   assert.match(r.notes.join(' '), /адрес/i);
 });
 
+test('выбор адреса показывает адреса кабинетов, а точный фильтр различает корпуса', async () => {
+  const first = 'улица Тестовая, д. 2, к. 1';
+  const second = 'улица Тестовая, д. 2, к. 2';
+  const resources = structuredClone(doctorsLi);
+  const complex = resources.payload.doctorsInfo[0].availableResources[0].complexResource;
+  complex[0].room = { defaultAddress: first };
+  complex.push({ id: 300000002 });
+  const api = fakeApi([
+    ['getDoctorsInfoForLI', { ok: true, json: resources }],
+    ['getAvailableResourceScheduleInfo', ({ complexResourceId }) => {
+      const json = structuredClone(schedule);
+      const room = json.payload.availableResource.complexResource[0];
+      room.id = complexResourceId;
+      room.room.defaultAddress = complexResourceId === 300000001 ? first : second;
+      json.payload.scheduleOfDay[0].scheduleBySlot[0].complexResourceId = complexResourceId;
+      return { ok: true, json };
+    }],
+  ]);
+  const targets = createTargets({ api, filters, util });
+  const target = { ...labTarget, addressContains: null, addressExact: second };
+  const preview = await targets.listAddresses(target, { now: NOW });
+  assert.deepEqual(preview.addresses, [first, second]);
+  assert.deepEqual(api.calls.slice(1).map((call) => call.body.complexResourceId), [300000002]);
+  const requestCount = api.calls.length;
+  const report = await targets.search(target, { now: NOW, appointments: [] });
+  assert.deepEqual(api.calls.slice(requestCount + 1).map((call) => call.body.complexResourceId), [300000002]);
+  assert.ok(report.candidates.length);
+  assert.ok(report.candidates.every((candidate) => candidate.address === second));
+  assert.equal(targets.validateCandidate(target, { ...report.candidates[0], address: first }, { now: NOW, appointments: [] }).ok, false);
+});
+
 test('shiftLab передаёт appointmentId и moId записи', async () => {
   const api = fakeApi([['getDoctorsInfoForLI', { ok: true, json: doctorsLi }], ['getAvailableResourceScheduleInfo', { ok: true, json: schedule }]]);
   const t = createTargets({ api, filters, util });
@@ -150,13 +181,22 @@ test('без dateTo и deadline горизонт поиска не схлопы�
   assert.ok(api.calls[0].body.assignment.period.dateTo > today, 'горизонт должен быть больше одного дня');
 });
 
-test('deadline цели используется как горизонт поиска, если dateTo не задан', async () => {
-  const api = fakeApi([['getDoctorsInfoForLI', { ok: true, json: doctorsLi }], ['getAvailableResourceScheduleInfo', { ok: true, json: schedule }]]);
+test('срок направления ограничивает слоты, полученные из 30-дневного расписания', async () => {
+  const response = structuredClone(schedule);
+  const day = response.payload.scheduleOfDay[0];
+  response.payload.scheduleOfDay.push({ ...day, date: '2026-10-01', scheduleBySlot: [{
+    ...day.scheduleBySlot[0],
+    slot: [{ startTime: '2026-10-01T09:00:00+03:00', endTime: '2026-10-01T09:15:00+03:00' }],
+  }] });
+  const api = fakeApi([['getDoctorsInfoForLI', { ok: true, json: doctorsLi }], ['getAvailableResourceScheduleInfo', { ok: true, json: response }]]);
   const t = createTargets({ api, filters, util });
   const { dateTo, ...rest } = labTarget;
   const target = { ...rest, deadline: '2026-09-30' };
-  await t.search(target, { now: NOW, appointments: [] });
-  assert.equal(api.calls[0].body.assignment.period.dateTo, '2026-09-30');
+  const report = await t.search(target, { now: NOW, appointments: [] });
+  assert.equal(api.calls[0].body.assignment.period.dateTo, '2026-10-23');
+  assert.equal(report.candidates.length, 2);
+  assert.equal(report.rejected[0].slot.startTime.slice(0, 10), '2026-10-01');
+  assert.match(report.rejected[0].reason, /позже/);
 });
 
 test('CRITICAL: несовпадение id кабинета в расписании не подставляет чужой адрес, кабинет пропускается', async () => {
@@ -251,6 +291,32 @@ test('act проверяет адрес найденной записи — чу
   const cand = { slot: { startTime: '2026-09-24T09:00:00+03:00', endTime: '2026-09-24T09:15:00+03:00' }, address: 'улица Тестовая, д. 2', resourceId: 200000001, complexResourceId: 300000001 };
   const r = await t.act(target, cand, { now: NOW, appointments: [] });
   assert.equal(r.verified, false);
+});
+
+test('другой выбранный корпус не подтверждает запись по адресу найденного слота', async () => {
+  const first = 'улица Тестовая, д. 2, к. 1';
+  const second = 'улица Тестовая, д. 2, к. 2';
+  const booked = {
+    id: 700000000009,
+    startTime: '2026-09-24T09:00:00',
+    endTime: '2026-09-24T09:15:00',
+    lpuAddress: second,
+    toBM: { id: 1 },
+  };
+  const api = fakeApi([
+    ['createAppointment', { ok: true, json: { payload: {} } }],
+    ['getAppointmentReceptionsByPatient', { ok: true, json: { payload: { appointment: [booked] } } }],
+  ]);
+  const targets = createTargets({ api, filters, util });
+  const target = { ...labTarget, exactAddresses: [first, second] };
+  const candidate = {
+    slot: { startTime: '2026-09-24T09:00:00+03:00', endTime: '2026-09-24T09:15:00+03:00' },
+    address: first, resourceId: 200000001, complexResourceId: 300000001,
+  };
+  const wrong = await targets.act(target, candidate, { now: NOW, appointments: [] });
+  assert.equal(wrong.verified, false);
+  const right = await targets.act(target, { ...candidate, address: second }, { now: NOW, appointments: [] });
+  assert.equal(right.verified, true);
 });
 
 test('act для shiftLab не засчитывает запись с другим видом анализа', async () => {
@@ -420,9 +486,12 @@ test('bookDoctor: needPurpose и нет выбранной цели визита
 
 // ---- C2: 429 при переборе кабинетов/врачей не должен долбить ЕМИАС дальше в этом же поиске ----
 
-test('C2: 429 на первом запросе расписания останавливает перебор остальных кабинетов в этом поиске', async () => {
+test('при 429 пропускает кабинет на один проход по остальным и затем возвращается к нему', async () => {
   let backoffUntil = 0;
-  let scheduleCalls = 0;
+  let time = NOW;
+  const failedRoom = 300000005;
+  const otherRoom = 300000006;
+  const visited = [];
   const api = {
     calls: [],
     backoffUntil: () => backoffUntil,
@@ -430,19 +499,31 @@ test('C2: 429 на первом запросе расписания остана
       api.calls.push({ path, body });
       if (path.includes('v5/saOrchestrator/getDoctorsInfo')) return { ok: true, json: doctorsV5Multi };
       if (path.includes('getAvailableResourceScheduleInfo')) {
-        scheduleCalls++;
-        backoffUntil = NOW + 30000; // как реальный api.js при 429/5xx
-        return { ok: false, status: 429, json: null, explained: { message: 'ЕМИАС просит не частить — пауза 30 секунд.', action: 'wait' } };
+        visited.push(body.complexResourceId);
+        if (body.complexResourceId === failedRoom) {
+          backoffUntil = time + 30000;
+          return { ok: false, status: 429, json: null, explained: { message: 'ЕМИАС просит не частить — пауза 30 секунд.', action: 'wait' } };
+        }
+        return { ok: true, json: schedule };
       }
       throw new Error('нет обработчика для ' + path);
     },
   };
   const t = createTargets({ api, filters, util });
   const target = { ...doctorTarget, source: { ...doctorTarget.source, needPurpose: false } };
-  const r = await t.search(target, { now: NOW, appointments: [] });
-  // doctorsV5Multi отдаёт ДВА ресурса — без гейта по backoff ушло бы два запроса расписания.
-  assert.equal(scheduleCalls, 1, 'после 429 второй запрос расписания в этом же поиске уходить не должен');
-  assert.equal(r.candidates.length, 0);
+  const r = await t.search(target, { now: time, appointments: [] });
+  assert.deepEqual(visited, [failedRoom]);
+  assert.equal(r.action, 'wait');
+  const requestCount = api.calls.length;
+  time += 29999;
+  await t.search(target, { now: time, appointments: [] });
+  assert.equal(api.calls.length, requestCount);
+  time += 1;
+  await t.search(target, { now: time, appointments: [] });
+  assert.deepEqual(visited, [failedRoom, otherRoom]);
+  time += 30000;
+  await t.search(target, { now: time, appointments: [] });
+  assert.deepEqual(visited, [failedRoom, otherRoom, failedRoom]);
 });
 
 test('act для bookDoctor шлёт createAppointment с availableResourceId/complexResourceId/startTime/endTime/referralId и целью визита', async () => {

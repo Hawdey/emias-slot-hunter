@@ -22,6 +22,7 @@
     };
     const stripCampus = (addr) => String(addr || '').replace(/,\s*к\.\s*\d+.*$/i, '').trim();
     const dayHuman = (ymd) => { const d = String(ymd).split('-'); return `${Number(d[2])} ${MONTHS[Number(d[1]) - 1]}`; };
+    const hasCurrentAddress = (option) => !!(option.current && typeof option.address === 'string' && option.address.trim());
 
     function buildTarget(option, form) {
       // form.when — три взаимоисключающих варианта:
@@ -44,7 +45,7 @@
       const deadline = option.deadline || null;
       // Искать за пределами срока действия направления бессмысленно — если человек
       // задал dateTo позже deadline (или deadline вообще не знал), обрезаем по deadline.
-      const dateTo = !form.dateTo ? null : (deadline && deadline < form.dateTo ? deadline : form.dateTo);
+      const dateTo = onlyDay || !form.dateTo ? null : (deadline && deadline < form.dateTo ? deadline : form.dateTo);
       const sameDoctor = option.scenario === 'shiftDoctor' && form.sameDoctor === true;
       const source = sameDoctor && !option.source.availableResourceId && form.doctor
         ? { ...option.source, availableResourceId: form.doctor.id, doctorName: form.doctor.name }
@@ -56,13 +57,14 @@
         current: option.current || null,
         onlyDay,
         anyTime,
-        dateFrom: form.dateFrom || null,
+        dateFrom: !onlyDay && form.dateFrom ? form.dateFrom : null,
         dateTo,
         deadline,
         timeFrom: form.timeFrom || null,
         timeTo: form.timeTo || null,
-        addressContains: form.where === 'sameCampus' ? stripCampus(option.address)
-          : form.where === 'contains' ? (form.addressContains || null) : null,
+        addressContains: form.where === 'sameCampus' && hasCurrentAddress(option) ? stripCampus(option.address)
+          : form.where === 'contains' ? (form.addressContains?.trim() || null) : null,
+        exactAddresses: form.where === 'choose' ? [...new Set(form.selectedAddresses || [])] : [],
         prefer: form.preferUntil ? { until: form.preferUntil, timeTo: form.preferTimeTo || null } : null,
         near: form.nearStart && form.nearEnd ? { start: form.nearStart, end: form.nearEnd } : null,
         respectTravel: form.respectTravel !== false,
@@ -85,7 +87,7 @@
     function describeTarget(t) {
       const parts = [];
       if (t.near) parts.push(`подгоняю ближе к ${human(t.near.start)}–${String(t.near.end).slice(11, 16)}`);
-      else if (t.onlyDay && t.anyTime) parts.push(`любое время ${dayHuman(t.onlyDay)}`);
+      else if (t.onlyDay && t.anyTime) parts.push(`только ${dayHuman(t.onlyDay)}`);
       else if (t.onlyDay && t.current) parts.push(`${dayHuman(t.onlyDay)}, раньше ${human(t.current)}`);
       else if (t.onlyDay) parts.push(`только ${dayHuman(t.onlyDay)}`);
       else if (t.current) parts.push(`раньше ${human(t.current)}`);
@@ -103,7 +105,10 @@
       }
 
       if (t.timeFrom || t.timeTo) parts.push(`время с ${t.timeFrom || '00:00'} до ${t.timeTo || '23:59'}`);
-      if (t.addressContains) parts.push(`адрес: ${t.addressContains}`);
+      const addresses = t.exactAddresses?.length ? t.exactAddresses : t.addressExact ? [t.addressExact] : [];
+      if (addresses.length) parts.push(addresses.length === 1 ? `точный адрес — ${addresses[0]}`
+        : `любой из выбранных адресов — ${addresses.join(' · ')}`);
+      else if (t.addressContains) parts.push(`адрес содержит «${t.addressContains}»`);
       if (t.scenario === 'shiftDoctor') {
         const doctor = t.source?.doctorName || 'врач из текущей записи';
         parts.push(t.sameDoctor ? `только ${doctor}` : 'любой врач из предложенных ЕМИАС');
@@ -114,7 +119,7 @@
         parts.push(preferText);
       }
       if (t.purpose) parts.push(`цель визита: ${purposeTitle(t.purpose)}`);
-      if (t.respectTravel) parts.push('с запасом на дорогу');
+      if (t.respectTravel) parts.push('час на дорогу между адресами');
       parts.push(t.mode === 'confirm' ? 'спрашиваю перед записью' : 'записываю сразу');
       parts.push(t.keepImproving ? 'продолжаю искать после успеха' : 'останавливаюсь после первого успеха');
 
@@ -122,8 +127,11 @@
       // отдельная формулировка «Запишу к <специальность> / на <исследование> по
       // направлению до <дата>» вместо общего «<title>: …» — дата уже учтена в head.
       if (byReferral) {
-        const last = t.dateTo || t.deadline || null;
-        const head = `Запишу ${t.scenario === 'bookLdp' ? 'на' : 'к'} ${t.title} по направлению` + (last ? ` до ${dayHuman(last)}` : '');
+        const last = t.onlyDay ? null : t.dateTo || t.deadline;
+        const first = t.onlyDay ? null : t.dateFrom;
+        const range = first ? ` с ${dayHuman(first)}` + (last ? ` по ${dayHuman(last)}` : '')
+          : last ? ` до ${dayHuman(last)}` : '';
+        const head = `Запишу ${t.scenario === 'bookLdp' ? 'на' : 'к'} ${t.title} по направлению` + range;
         return parts.length ? `${head}, ${parts.join(', ')}` : head;
       }
 
@@ -155,7 +163,7 @@
     }
 
     return {
-      buildTarget, describeTarget, describeDryRunItem, saveConfig, loadConfig, applyBookedUpdate, human, stripCampus, KEY,
+      buildTarget, describeTarget, describeDryRunItem, saveConfig, loadConfig, applyBookedUpdate, human, stripCampus, hasCurrentAddress, KEY,
       INQUIRY_PURPOSES,
     };
   }

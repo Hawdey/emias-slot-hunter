@@ -30,7 +30,22 @@
       SA_APPOINTMENT_CANNOT_BE_CANCELED: { message: 'ЕМИАС не даёт перенести эту запись: приём уже начался, запись отменена или такой перенос сайт не разрешает. Цель остановлена.', action: 'stopTarget' },
     };
 
-    function explain({ status, code, text }) {
+    function explain({ status, code, description, pauseSeconds }) {
+      if (status === 429) return { message: `ЕМИАС ограничил частоту запросов. Пауза ${pauseSeconds ?? 60} сек.`, action: 'wait' };
+      if (status >= 500) return { message: `ЕМИАС временно отвечает ошибкой. Пауза ${pauseSeconds ?? 30} сек.`, action: 'wait' };
+      if (code === 'SA_REFERRAL_FOR_FUTURE') {
+        const date = typeof description === 'string'
+          ? description.match(/^Запись по этому направлению будет доступна с (\d{4}-\d{2}-\d{2})\.?\s*$/i)?.[1]
+          : null;
+        const day = date && new Date(date);
+        const validDate = day && Number.isFinite(day.getTime()) && day.toISOString().slice(0, 10) === date;
+        return {
+          action: 'stopTarget',
+          earliestDay: validDate ? date : null,
+          message: validDate ? 'ЕМИАС указал первую дату приёма: ' + date.split('-').reverse().join('.') + '.'
+            : 'ЕМИАС не вернул дату начала приёма по направлению. Проверьте его на сайте.',
+        };
+      }
       if (Object.hasOwn(KNOWN, code)) return KNOWN[code];
       // I4: в реальном пути 401 сюда не доходит — core/api.js сам перехватывает
       // 401 до вызова explain() (один раз продлевает сессию и повторяет запрос,
@@ -41,8 +56,6 @@
       // порядок обработки 401 в api.js когда-нибудь изменится — тест ниже
       // прямо помечен как проверка explain() в изоляции, а не сквозного пути.
       if (status === 401) return { message: 'ЕМИАС перестал принимать вход. Войдите заново в другой вкладке — поиск продолжится сам.', action: 'relogin' };
-      if (status === 429) return { message: 'ЕМИАС просит не частить — пауза 30 секунд.', action: 'wait' };
-      if (status >= 500) return { message: 'ЕМИАС временно отвечает ошибкой — пауза 30 секунд.', action: 'wait' };
       return { message: 'ЕМИАС вернул неожиданный ответ. Повторите проверку или откройте записи на сайте.', action: 'retry' };
     }
 

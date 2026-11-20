@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.7';
+  const VERSION = '0.2.3';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -39,10 +39,10 @@
         const response = await fetch(url, { ...opts, mode: 'same-origin', redirect: 'error', signal: controller.signal });
         if (typeof response.text !== 'function') {
           const json = await response.json();
-          return { ok: response.ok, status: response.status, json: async () => json, text: async () => JSON.stringify(json) };
+          return { ok: response.ok, status: response.status, headers: response.headers, json: async () => json, text: async () => JSON.stringify(json) };
         }
         const text = await response.text();
-        return { ok: response.ok, status: response.status, text: async () => text, json: async () => JSON.parse(text) };
+        return { ok: response.ok, status: response.status, headers: response.headers, text: async () => text, json: async () => JSON.parse(text) };
       };
       try { return await Promise.race([request(), expired]); }
       finally { clearTimeout(timeout); }

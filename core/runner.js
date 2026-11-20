@@ -6,6 +6,8 @@
 (function (root) {
   'use strict';
 
+  const MAX_SEARCH_REQUESTS = 6;
+
   function hash(obj) {
     const s = JSON.stringify(obj);
     let h = 0;
@@ -44,6 +46,7 @@
     let generation = 0;
     let offerSequence = 0;
     let booking = null;
+    let resumeAfterTarget = null;
     const isCurrent = (run) => state.running && run === generation
       && state.confirmed === gateFingerprint(state.list);
     const aborted = () => ({ ok: false, aborted: true, message: 'Запись больше не актуальна.' });
@@ -60,6 +63,7 @@
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
       state.pending = {};
+      resumeAfterTarget = null;
       for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
@@ -70,8 +74,10 @@
       if (wasRunning) emit('needDryRun', { message: 'цели изменились — нужен новый холостой прогон' });
     }
 
-    async function appointments() {
-      const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
+    async function appointments(active) {
+      const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {}, active);
+      if (r.aborted) return null;
+      if (r.ok && r.status === 204 && r.json == null) return [];
       const list = r.json?.payload?.appointment;
       if (!r.ok || !Array.isArray(list) || list.some((a) => a?.id == null || typeof a.startTime !== 'string')) {
         throw new Error('Не удалось получить список записей ЕМИАС. Запись приостановлена до успешной проверки.');
@@ -157,9 +163,10 @@
 
     async function dryRun() {
       const version = generation;
-      const appts = await appointments();
+      const appts = await appointments(() => version === generation);
       if (version !== generation) throw new Error('Цели изменились. Повторите проверку.');
       const items = [];
+      const budget = { remaining: MAX_SEARCH_REQUESTS };
       for (const t of state.list) {
         const existing = existingAppointment(t, appts);
         if (existing) {
@@ -170,7 +177,7 @@
         }
         let r;
         try {
-          r = await targets.search(t, { now: now(), appointments: appts, active: () => version === generation });
+          r = await targets.search(t, { now: now(), appointments: appts, budget, active: () => version === generation });
         } catch (e) {
           // Холостой прогон не должен падать целиком из-за одной сбойной
           // цели — иначе человек не увидит отчёт по остальным целям и не
@@ -235,7 +242,8 @@
       // джиттера не должна увести фактическую задержку ниже 30 секунд.
       const jittered = Math.round(base * (0.8 + Math.random() * 0.4));
       const run = generation;
-      timer.schedule(Math.max(config.minIntervalMs, jittered), () => {
+      const delay = Math.max(config.minIntervalMs, jittered, api.backoffUntil() - now());
+      timer.schedule(Math.min(delay, 2147483647), () => {
         if (run === generation) return tick();
       });
     }
@@ -258,8 +266,8 @@
         try { session.assertContext?.(scope); return true; }
         catch (e) { return false; }
       };
-      const appts = await appointments();
-      if (!canSend()) return aborted();
+      const appts = await appointments(canSend);
+      if (!appts || !canSend()) return aborted();
       if (existingAppointment(t, appts)) {
         adoptExisting(t, appts);
         return { ok: false, message: 'По этому направлению уже есть запись. Проверьте её в ЕМИАС.' };
@@ -381,27 +389,33 @@
       // больше, чем должно быть по расписанию, — это не «мы решили не
       // проверять», а комп/браузер были неактивны.
       const gap = now() - state.lastTickAt;
-      if (state.lastTickAt && gap > interval() * config.sleepFactor) {
+      const expected = Math.max(interval(), api.backoffUntil() - state.lastTickAt);
+      if (state.lastTickAt && gap > expected * config.sleepFactor) {
         emit('slept', { from: state.lastTickAt, to: now(), missed: Math.round(gap / interval()) });
       }
       state.lastTickAt = now();
-      state.lastCheckAt = now();
 
       try {
         session.assertContext?.();
         if (now() >= api.backoffUntil()) {
-          const appts = await appointments();
-          if (!active()) return;
+          state.lastCheckAt = now();
+          const appts = await appointments(active);
+          if (!appts || !active()) return;
           // Ошибки запросов расписания не засчитываем как успешную проверку.
           let searchOk = true;
+          const budget = { remaining: MAX_SEARCH_REQUESTS };
+          const next = state.list.findIndex((t) => t.id === resumeAfterTarget) + 1;
+          const order = [...state.list.slice(next), ...state.list.slice(0, next)];
+          resumeAfterTarget = null;
           targetsLoop:
-          for (const t of state.list) {
+          for (const t of order) {
             // C2: backoffUntil проверяли только один раз в начале tick() (выше) — но
             // targets.search() сам может нарваться на 429 ПОСЕРЕДИНЕ этого перебора
             // (например, у первой цели), и тогда без этой проверки раннер всё равно
             // продолжил бы дёргать ЕМИАС по остальным целям в том же тике.
             if (!active()) return;
             if (now() < api.backoffUntil()) { searchOk = false; break targetsLoop; }
+            if (!budget.remaining) break targetsLoop;
             const st = state.byId[t.id];
             // 'improving' — цель уже выполнена один раз, но keepImproving
             // просит продолжать искать более удобный слот, поэтому такую
@@ -424,9 +438,11 @@
               continue;
             }
 
-            const r = await targets.search(t, { now: now(), appointments: appts, active });
+            const r = await targets.search(t, { now: now(), appointments: appts, active, reuseResources: true, budget });
             if (!active()) return;
-            if (r.action === 'wait' || r.action === 'retry') searchOk = false;
+            const paused = now() < api.backoffUntil();
+            if (paused || !budget.remaining) resumeAfterTarget = t.id;
+            if (paused || r.action === 'wait' || r.action === 'retry') searchOk = false;
 
             if (r.action === 'stopTarget') {
               const message = (r.notes && r.notes.join('; ')) || 'цель остановлена';
@@ -443,8 +459,10 @@
               return;
             }
 
-            if (!r.candidates.length) {
-              if (r.notes && r.notes.length) log(`${t.title}: ${r.notes.join('; ')}`);
+            if (paused || !r.candidates.length) {
+              const note = (r.notes && r.notes.length) ? r.notes.join('; ')
+                : !paused && r.rejected.length ? 'Расписание получено, подходящих по условиям слотов нет.' : '';
+              if (note) log(`${t.title}: ${note}`);
               continue;
             }
 
@@ -462,6 +480,10 @@
 
             const res = await finish(t, cand, run);
             if (!active() || res.action === 'relogin') return;
+            if (now() < api.backoffUntil()) {
+              resumeAfterTarget = t.id;
+              searchOk = false;
+            }
           }
           if (searchOk && now() >= api.backoffUntil()) {
             state.lastOkAt = now();
@@ -477,7 +499,7 @@
       // Протухание: считаем от старта/последней удавшейся проверки. Как
       // только разрыв достиг трёх интервалов — сообщаем один раз и молчим
       // до следующей удачной проверки (staleNotified сбрасывается выше).
-      if (now() - state.lastOkAt >= interval() * config.staleFactor && !state.staleNotified) {
+      if (now() >= api.backoffUntil() && now() - state.lastOkAt >= interval() * config.staleFactor && !state.staleNotified) {
         state.staleNotified = true;
         emit('stale', { since: state.lastOkAt });
       }
@@ -497,6 +519,7 @@
         lastTickAt: state.lastTickAt,
         lastCheckAt: state.lastCheckAt,
         lastOkAt: state.lastOkAt,
+        pausedUntil: api.backoffUntil(),
         sessionRefreshedAt: session.refreshedAt,
         targets: state.list.map((t) => ({ id: t.id, title: t.title, current: t.current || null, ...state.byId[t.id] })),
         pending: Object.keys(state.pending),

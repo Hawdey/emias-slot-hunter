@@ -81,6 +81,14 @@ test('travelOk игнорирует саму переносимую запись
   assert.equal(f.travelOk({ selfId: 9, address: 'улица Тестовая, д. 1', slot: slot9, appointments: appts, travelMs: 3600000 }), true);
 });
 
+test('без запаса на дорогу совпадающие по времени приёмы всё равно отсекаются', () => {
+  const appts = [{ id: 9, startTime: '2026-09-25T12:00:00', endTime: '2026-09-25T12:30:00', lpuAddress: 'улица Другая, д. 2' }];
+  const result = pick([slot('2026-09-25T12:15:00+03:00'), slot('2026-09-25T12:30:00+03:00')],
+    { ...base, respectTravel: false }, appts);
+  assert.equal(result.rejected[0].reason, 'пересечение с другой записью');
+  assert.deepEqual(result.ok.map((item) => item.startTime), ['2026-09-25T12:30:00+03:00']);
+});
+
 test('onlyIfConflict: если текущая запись ни с чем не конфликтует, слоты не предлагаются', () => {
   const t = { ...base, current: '2026-09-25T18:00:00+03:00', onlyDay: '2026-09-25', onlyIfConflict: true, selfId: 5 };
   const appts = [

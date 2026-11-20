@@ -203,7 +203,7 @@
       .esh-badge.k-paused { background: #8a6d3b; }
       .esh-badge.k-needLogin, .esh-badge.k-needIdentity, .esh-badge.k-sessionLost, .esh-badge.k-stale, .esh-badge.k-resumeError, .esh-badge.k-needDryRun { background: #d64545; }
       .esh-sub { display: block; font-size: 11px; opacity: .85; font-weight: normal; }
-      .esh-card { width: 320px; max-width: calc(100vw - 32px); box-sizing: border-box; max-height: 70vh; overflow: auto; background: #fff; color: #222; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,.3); padding: 14px; }
+      .esh-card { width: 420px; max-width: calc(100vw - 32px); box-sizing: border-box; max-height: 75vh; overflow: auto; background: #fff; color: #222; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,.3); padding: 14px; }
       .esh-card h3 { margin: 0 0 8px; font-size: 16px; }
       .esh-card p { margin: 4px 0; font-size: 13px; line-height: 1.4; }
       .esh-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
@@ -212,8 +212,18 @@
       .esh-opt .title { font-weight: 600; font-size: 13px; }
       .esh-opt .meta { font-size: 12px; color: #666; }
       .esh-opt .reason { font-size: 12px; color: #a33; }
-      .esh-field { display: block; font-size: 12px; margin: 6px 0 2px; color: #444; }
-      .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time] { width: 100%; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; }
+      .esh-field { display: block; min-width: 0; font-size: 12px; margin: 4px 0 2px; color: #444; }
+      .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time], .esh-card select { width: 100%; min-width: 0; min-height: 34px; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; background: #fff; color: #222; }
+      .esh-section { min-width: 0; border: 0; border-top: 1px solid #e8eaed; margin: 12px 0 0; padding: 6px 0 0; }
+      .esh-section legend { padding: 0 6px 0 0; font-size: 13px; font-weight: 600; }
+      .esh-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 10px; }
+      .esh-addresses { min-width: 0; margin: 8px 0 2px; padding: 0; border: 0; font-size: 13px; }
+      .esh-address-list { max-height: 172px; overflow: auto; padding: 2px 4px; }
+      .esh-address-list .esh-row { margin: 0; padding: 5px 0; cursor: pointer; }
+      .esh-address-list input { flex: none; }
+      .esh-card button.esh-load { margin-top: 6px; }
+      .esh-card .esh-example { color: #535a64; }
+      @media (max-width: 335px) { .esh-grid { grid-template-columns: minmax(0, 1fr); } }
       .esh-btns { display: flex; gap: 8px; margin-top: 12px; }
       .esh-btn { flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; background: #f4f4f4; cursor: pointer; font-size: 13px; }
       .esh-btn.primary { background: #2e7dd7; color: #fff; border-color: #2e7dd7; }
@@ -233,7 +243,6 @@
       .esh-slept[hidden] { display: none; }
       .esh-log { font-size: 12px; max-height: 160px; overflow: auto; background: #fafafa; border: 1px solid #eee; border-radius: 6px; padding: 6px; }
       .esh-log div { margin-bottom: 4px; }
-      details.esh-more summary { cursor: pointer; font-size: 12px; color: #2e7dd7; margin-top: 6px; }
     `;
   }
 
@@ -451,6 +460,7 @@
 
   function describeOptionMeta(option) {
     const parts = [];
+    if (!option.current) parts.push('новая запись по направлению');
     if (option.source?.doctorName) parts.push(option.source.doctorName);
     if (option.current) parts.push('сейчас записано на ' + ui.human(option.current));
     if (option.address) parts.push(ui.stripCampus(option.address));
@@ -478,10 +488,9 @@
   function ensureForm(option) {
     if (!wizard.forms[option.id]) {
       wizard.forms[option.id] = {
-        // Для новой записи 'earlier' показывается как «как можно раньше».
         when: 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
-        where: option.address ? 'sameCampus' : 'any', addressContains: '',
+        where: ui.hasCurrentAddress(option) ? 'sameCampus' : 'any', addressContains: '', selectedAddresses: [],
         respectTravel: true, mode: 'confirm', purpose: 'unwell', keepImproving: false, sameDoctor: false,
       };
     }
@@ -559,52 +568,111 @@
     return h('div', {}, [h('label', { class: 'esh-field', text: 'Цель визита' }), group]);
   }
 
-  function whenField(option, form, update, quiet) {
-    const opts = [
-      ['earlier', option.current ? 'раньше, чем сейчас записано' : 'как можно раньше'],
-      ...(option.current ? [['sameDayEarlier', 'в тот же день, но раньше']] : []),
-      ['onlyDay', 'в выбранный день, в любое время'],
-    ];
-    const group = h('div', {}, opts.map(([val, text]) => h('label', { class: 'esh-row' }, [
-      h('input', { type: 'radio', name: 'when-' + option.id, checked: form.when === val, onchange: () => update({ when: val }) }),
-      h('span', { text }),
-    ])));
-    const dayInput = form.when === 'onlyDay' ? h('input', {
-      type: 'date', value: form.day, onchange: (e) => quiet({ day: e.target.value }),
-    }) : null;
-    return h('div', {}, [group, dayInput]);
+  function selectField(label, value, choices, change) {
+    return h('label', { class: 'esh-field' }, [
+      label, h('select', { 'aria-label': label, onchange: (e) => change(e.target.value) },
+        choices.map(([id, text]) => h('option', { value: id, text, selected: id === value }))),
+    ]);
+  }
+
+  function dateAndTimeFields(option, form, update, quiet) {
+    const days = option.current
+      ? [['earlier', 'Раньше текущей записи'], ['sameDayEarlier', 'В тот же день, но раньше'], ['onlyDay', 'На выбранную дату']]
+      : [['earlier', 'Диапазон дат'], ['onlyDay', 'Одна дата']];
+    const input = (label, type, key) => h('label', { class: 'esh-field' }, [
+      label, h('input', { type, value: form[key], onchange: (e) => quiet({ [key]: e.target.value }) }),
+    ]);
+    let dates;
+    if (form.when === 'onlyDay') dates = input('Дата приёма', 'date', 'day');
+    else if (form.when === 'sameDayEarlier') dates = h('p', { class: 'esh-note', text: `Текущий приём — ${ui.human(option.current)}.` });
+    else dates = h('div', { class: 'esh-grid' }, [
+      input('Дата с', 'date', 'dateFrom'), input('Дата по', 'date', 'dateTo'),
+    ]);
+    return h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Дата и время' }),
+      selectField(option.current ? 'Когда перенести' : 'Дни поиска', form.when, days, (when) => update({ when })),
+      dates,
+      option.current && form.when === 'onlyDay' ? h('p', { class: 'esh-note', text: 'Можно выбрать дату позже текущей записи.' }) : null,
+      h('div', { class: 'esh-grid' }, [
+        input('Время с (МСК)', 'time', 'timeFrom'), input('Время по (МСК)', 'time', 'timeTo'),
+      ]),
+      h('p', { class: 'esh-note', text: 'Время — начало приёма. Если оставить время пустым, подойдут все часы.' }),
+    ]);
   }
 
   function whereField(option, form, update, quiet) {
-    const opts = [
-      ...(option.address ? [['sameCampus', 'по этому же адресу (любой корпус)']] : []),
-      ['any', 'где угодно'],
-      ['contains', 'адрес содержит:'],
+    const choices = [
+      ...(ui.hasCurrentAddress(option) ? [['sameCampus', 'Адрес текущей записи']] : []),
+      ['any', 'Любой адрес из ЕМИАС'],
+      ['choose', 'Выбрать адреса из списка'],
+      ['contains', 'Указать часть адреса'],
     ];
-    const group = h('div', {}, opts.map(([val, text]) => h('label', { class: 'esh-row' }, [
-      h('input', { type: 'radio', name: 'where-' + option.id, checked: form.where === val, onchange: () => update({ where: val }) }),
-      h('span', { text }),
-    ])));
-    const addrInput = form.where === 'contains' ? h('input', {
-      type: 'text', value: form.addressContains, placeholder: 'например, Ленина',
-      oninput: (e) => quiet({ addressContains: e.target.value }),
-    }) : null;
-    return h('div', {}, [group, addrInput]);
+    const field = h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Место приёма' }),
+      selectField('Где искать', form.where, choices, (where) => update({ where })),
+    ]);
+    if (form.where === 'sameCampus') {
+      field.appendChild(h('p', { class: 'esh-note', text: `Подойдут корпуса по адресу ${ui.stripCampus(option.address)}.` }));
+    } else if (form.where === 'contains') {
+      field.appendChild(h('label', { class: 'esh-field' }, ['Часть адреса', h('input', {
+        type: 'text', value: form.addressContains, placeholder: 'Улица или дом',
+        oninput: (e) => quiet({ addressContains: e.target.value }),
+      })]));
+    } else if (form.where === 'choose') {
+      if (form.addresses?.length) {
+        const choices = form.addresses.map((address) => h('label', { class: 'esh-row' }, [
+          h('input', {
+            type: 'checkbox', value: address, checked: form.selectedAddresses.includes(address),
+            onchange: (event) => {
+              const selected = form.selectedAddresses.filter((entry) => entry !== address);
+              if (event.target.checked) selected.push(address);
+              quiet({ selectedAddresses: selected });
+            },
+          }),
+          h('span', { text: address }),
+        ]));
+        field.appendChild(h('fieldset', { class: 'esh-addresses' }, [
+          h('legend', { text: 'Отметьте подходящие адреса' }),
+          h('div', { class: 'esh-address-list' }, choices),
+        ]));
+      } else if (form.addresses) {
+        field.appendChild(h('p', { class: 'esh-note', text: 'ЕМИАС пока не предложил адреса для этих условий. Можно указать часть адреса.' }));
+      }
+      if (form.addressNotice) field.appendChild(h('p', { class: 'esh-note', text: form.addressNotice }));
+      if (form.addressError) field.appendChild(h('p', { class: 'esh-warn', text: form.addressError, role: 'status' }));
+      field.appendChild(h('button', {
+        class: 'esh-btn esh-load', disabled: !!form.loadingAddresses,
+        text: form.loadingAddresses ? 'Загружаю адреса…' : form.addresses ? 'Обновить список адресов' : 'Загрузить адреса из ЕМИАС',
+        onclick: () => loadAddresses(option, form, update),
+      }));
+    }
+    return field;
   }
 
-  function advancedFields(form, quiet) {
-    const field = (label, type, key) => h('label', { class: 'esh-field' }, [
-      label, h('input', { type, value: form[key], onchange: (e) => quiet({ [key]: e.target.value }) }),
-    ]);
-    // Раскрыт ли блок, помним в форме: шаг перерисовывается при выборе любого
-    // переключателя, и без этого блок каждый раз схлопывался заново.
-    return h('details', { class: 'esh-more', open: !!form.moreOpen, ontoggle: (e) => { form.moreOpen = e.target.open; } }, [
-      h('summary', { text: 'Дополнительно: даты и время' }),
-      field('Не раньше какого дня', 'date', 'dateFrom'),
-      field('Не позже какого дня', 'date', 'dateTo'),
-      field('Время не раньше', 'time', 'timeFrom'),
-      field('Время не позже', 'time', 'timeTo'),
-    ]);
+  async function loadAddresses(option, form, update) {
+    if (form.loadingAddresses) return;
+    const error = dateOrDoctorError(option, form);
+    if (error) { update({ addressError: error }); return; }
+    const generation = wizardGeneration;
+    const target = ui.buildTarget(option, form);
+    update({ loadingAddresses: true, addressError: '', addressNotice: '' });
+    const visible = () => generation === wizardGeneration && wizard.open && wizard.step === 2;
+    const active = () => visible() && form.where === 'choose';
+    try {
+      const { addresses, notice } = await core.listAddresses(target, active);
+      if (active()) {
+        const selectedAddresses = form.selectedAddresses.filter((address) => addresses.includes(address));
+        const removed = selectedAddresses.length < form.selectedAddresses.length;
+        const addressNotice = [notice, removed ? 'Часть отмеченных адресов исчезла из списка ЕМИАС. Проверьте выбор.' : ''].filter(Boolean).join(' ');
+        update({ addresses, selectedAddresses, addressNotice, loadingAddresses: false });
+      }
+    } catch (error) {
+      if (!active()) return;
+      if (error.name === 'SessionError') { onSessionLost(error); return; }
+      update({ addressError: error.message, loadingAddresses: false });
+    } finally {
+      form.loadingAddresses = false;
+    }
   }
 
   function renderTargetCard(option) {
@@ -617,27 +685,30 @@
     const quiet = (patch) => { Object.assign(form, patch); refreshStepTwoState(); };
     const card = h('div', { class: 'esh-opt' });
     card.appendChild(h('div', { class: 'title', text: option.title }));
+    card.appendChild(h('div', { class: 'meta', text: describeOptionMeta(option) }));
     const doctor = doctorField(option, form, update);
     if (doctor) card.appendChild(doctor);
-    card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
-    card.appendChild(whenField(option, form, update, quiet));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
-    card.appendChild(whereField(option, form, update, quiet));
     const purpose = purposeField(option, form, update);
     if (purpose) card.appendChild(purpose);
-    card.appendChild(h('label', { class: 'esh-row' }, [
-      h('input', { type: 'checkbox', checked: form.respectTravel, onchange: (e) => update({ respectTravel: e.target.checked }) }),
-      h('span', { text: 'Учитывать время на дорогу между записями' }),
+    card.appendChild(dateAndTimeFields(option, form, update, quiet));
+    card.appendChild(whereField(option, form, update, quiet));
+    card.appendChild(h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Другие приёмы в тот же день' }),
+      h('label', { class: 'esh-row' }, [
+        h('input', { type: 'checkbox', checked: form.respectTravel, onchange: (e) => quiet({ respectTravel: e.target.checked }) }),
+        h('span', { text: 'Оставлять час на дорогу между адресами' }),
+      ]),
+      h('p', { class: 'esh-note esh-example', text: 'Если приём по другому адресу заканчивается в 09:00, новый слот подойдёт с 10:00. Пересекающиеся приёмы пропускаются всегда.' }),
     ]));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Как записывать' }));
-    card.appendChild(h('div', {}, [
+    card.appendChild(h('fieldset', { class: 'esh-section' }, [
+      h('legend', { text: 'Когда найден слот' }),
       h('label', { class: 'esh-row' }, [
         h('input', { type: 'radio', name: 'mode-' + option.id, checked: form.mode === 'auto', onchange: () => update({ mode: 'auto' }) }),
-        h('span', { text: 'сразу, без вопросов' }),
+        h('span', { text: option.current ? 'Перенести сразу' : 'Записать сразу' }),
       ]),
       h('label', { class: 'esh-row' }, [
         h('input', { type: 'radio', name: 'mode-' + option.id, checked: form.mode === 'confirm', onchange: () => update({ mode: 'confirm' }) }),
-        h('span', { text: 'сначала спрашивать' }),
+        h('span', { text: option.current ? 'Спросить перед переносом' : 'Спросить перед записью' }),
       ]),
     ]));
     if (form.when !== 'onlyDay') {
@@ -646,7 +717,6 @@
         h('span', { text: 'Продолжать искать более ранний слот после успеха' }),
       ]));
     }
-    card.appendChild(advancedFields(form, quiet));
     const error = stepTwoError(option, form);
     const errorEl = h('p', { class: 'esh-warn', text: error || '', hidden: !error });
     errorEl.dataset.optionId = option.id;
@@ -654,12 +724,22 @@
     return card;
   }
 
+  function dateOrDoctorError(option, form) {
+    if (option.scenario === 'shiftDoctor' && form.sameDoctor && !option.source.availableResourceId && !form.doctor) return 'Выберите врача для переноса.';
+    if (form.when === 'onlyDay' && !form.day) return 'Выберите дату приёма.';
+    if (form.when === 'onlyDay' && option.deadline && form.day > option.deadline.slice(0, 10)) return 'Эта дата позже срока направления.';
+    if (form.when === 'earlier' && form.dateFrom && form.dateTo && form.dateFrom > form.dateTo) return 'Дата «по» не может быть раньше даты «с».';
+    if (form.when === 'earlier' && option.deadline && form.dateFrom > option.deadline.slice(0, 10)) return 'Начало поиска позже срока направления.';
+    if (form.when === 'earlier' && option.current && form.dateFrom > option.current.slice(0, 10)) return 'Начальная дата уже позже текущей записи. Измените дату или режим переноса.';
+    if (form.timeFrom && form.timeTo && form.timeFrom > form.timeTo) return 'Время «по» не может быть раньше времени «с».';
+    return null;
+  }
+
   function stepTwoError(option, form) {
-    if (option.scenario === 'shiftDoctor' && form.sameDoctor && !option.source.availableResourceId && !form.doctor) return 'выберите врача для переноса';
-    if (form.when === 'onlyDay' && !form.day) return 'выберите день';
-    if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
-    if (form.dateFrom && form.dateTo && form.dateFrom > form.dateTo) return 'проверьте порядок дат';
-    if (form.timeFrom && form.timeTo && form.timeFrom > form.timeTo) return 'проверьте порядок времени';
+    const error = dateOrDoctorError(option, form);
+    if (error) return error;
+    if (form.where === 'contains' && !form.addressContains.trim()) return 'Укажите часть адреса.';
+    if (form.where === 'choose' && !form.selectedAddresses.length) return 'Отметьте хотя бы один адрес или измените условие места.';
     return null;
   }
 
@@ -675,6 +755,7 @@
   }
 
   function renderStep2(selected) {
+    const scrollTop = dom.panel.scrollTop;
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: 'Шаг 2 из 3. Условия поиска' }));
     dom.panel.appendChild(h('div', {}, selected.map(renderTargetCard)));
@@ -683,6 +764,7 @@
     const next = h('button', { class: 'esh-btn primary', text: 'Далее', disabled: hasErrors, onclick: () => openWizard(3) });
     next.dataset.role = 'step2-next';
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back, next]));
+    dom.panel.scrollTop = scrollTop;
   }
 
   // Обновляет ошибки карточек и кнопку «Далее» на шаге 2 без перерисовки.
@@ -961,8 +1043,11 @@
   function runningDetail() {
     if (badgeNote && Date.now() < badgeNote.until) return badgeNote.text;
     badgeNote = null;
-    const t = core.status().lastCheckAt;
-    return t ? 'проверено в ' + hhmm(t) : 'ожидаю первую проверку';
+    const status = core.status();
+    if (Date.now() < status.pausedUntil) {
+      return 'пауза ЕМИАС · ещё ' + Math.ceil((status.pausedUntil - Date.now()) / 1000) + ' с';
+    }
+    return status.lastCheckAt ? 'проверено в ' + hhmm(status.lastCheckAt) : 'ожидаю первую проверку';
   }
 
   /* ==================== события ядра ==================== */
@@ -1093,7 +1178,7 @@
       if (!status.running) return;
       try { core.checkSession(); }
       catch (e) { onSessionLost({ message: e.message }); return; }
-      if (Date.now() - status.lastOkAt > 90000) onStale({ since: status.lastOkAt });
+      if (Date.now() >= status.pausedUntil && Date.now() - status.lastOkAt > 90000) onStale({ since: status.lastOkAt });
       else if (badgeState.kind !== 'booked') setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: runningDetail() });
       if (panelMode === 'status') renderStatusPanel();
     }, 5000);
@@ -1110,7 +1195,8 @@
     const timer = createWorkerTimer();
     let channel = null;
     try { channel = new BroadcastChannel('emias-slot-hunter'); } catch (e) { channel = null; }
-    core = create({ storage: siteStorage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, channel });
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    core = create({ storage: siteStorage, fetch: window.fetch.bind(window), now: () => Date.now(), timer, wait, channel });
     subscribeCore();
     setBadge({ kind: 'idle', text: '🎯 Настроить', detail: '' });
   }

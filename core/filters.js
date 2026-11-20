@@ -46,6 +46,7 @@
       const ok = [];
       const rejected = [];
       const reject = (slot, reason) => rejected.push({ slot, reason });
+      const travelMs = t.respectTravel ? t.travelMs || 0 : 0;
 
       // onlyIfConflict: не трогаем запись, если она ни с чем не пересекается —
       // тогда искать замену незачем, возвращаем пустой результат с пометкой skipped.
@@ -54,7 +55,7 @@
         const hasConflict = self ? !travelOk({
           selfId: t.selfId, address: self.lpuAddress,
           slot: { startTime: self.startTime, endTime: self.endTime },
-          appointments, travelMs: t.travelMs,
+          appointments, travelMs,
         }) : false;
         if (!hasConflict) return { ok: [], rejected: [], skipped: 'конфликта нет' };
       }
@@ -83,8 +84,8 @@
         if (t.near) {
           if (curDist != null && distTo(t.near, s, toMs(slot.endTime)) >= curDist) { reject(slot, 'не ближе к нужной записи'); continue; }
         } else if (cur != null && !t.anyTime && s >= cur) { reject(slot, 'позже текущей записи'); continue; }
-        if (t.respectTravel && !travelOk({ selfId: t.selfId, address: addressOf(slot), slot, appointments, travelMs: t.travelMs })) {
-          reject(slot, 'не успеть доехать между записями'); continue;
+        if (!travelOk({ selfId: t.selfId, address: addressOf(slot), slot, appointments, travelMs })) {
+          reject(slot, travelMs ? 'пересечение или недостаточно времени на дорогу' : 'пересечение с другой записью'); continue;
         }
         ok.push(slot);
       }

@@ -102,6 +102,19 @@ test('buildTarget: «в выбранный день» делает цель вы
   assert.equal(t.anyTime, true);
 });
 
+test('выбранный день не наследует скрытый диапазон, адрес медорганизации не становится адресом записи', () => {
+  const referral = { ...option, current: null, scenario: 'bookLab', address: 'Тестовая поликлиника' };
+  const t = ui.buildTarget(referral, {
+    when: 'onlyDay', day: '2026-10-05', dateFrom: '2026-09-24', dateTo: '2026-09-25',
+    timeFrom: '08:00', timeTo: '10:00', where: 'sameCampus',
+  });
+  assert.equal(t.dateFrom, null);
+  assert.equal(t.dateTo, null);
+  assert.equal(t.timeFrom, '08:00');
+  assert.equal(t.addressContains, null);
+  assert.match(ui.describeTarget(t), /только 5 октября.*08:00 до 10:00/);
+});
+
 test('buildTarget: deadline ограничивает dateTo и попадает в цель отдельным полем', () => {
   const withDeadline = { ...option, deadline: '2026-10-14' };
   const t1 = ui.buildTarget(withDeadline, { when: 'earlier', where: 'any', mode: 'auto', dateTo: '2026-11-30' });

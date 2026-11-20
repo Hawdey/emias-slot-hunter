@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами (личная версия)
 // @namespace    emias-slot-hunter-personal
-// @version      0.1.7
+// @version      0.2.3
 // @description  Следит за расписанием ЕМИАС и ловит освободившиеся слоты: записывает по направлению и переносит записи на более раннее время
 // @author       polinalamponi
 // @homepageURL  https://github.com/Hawdey/emias-slot-hunter

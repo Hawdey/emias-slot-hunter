@@ -649,13 +649,13 @@ test('I4: relogin из act() не двигает lastOkAt вперёд', async (
 // тика, но и между целями — иначе первая же 429 не мешает раннеру пройтись
 // по остальным целям в этом же тике ---
 
-test('C2: если пауза (backoffUntil) наступила после первой цели, вторая цель в этом тике не проверяется', async () => {
+test('после паузы от первой цели раннер начинает со второй', async () => {
   let backoffUntil = 0;
-  let searchCalls = 0;
+  const searched = [];
   const h = harness({
-    search: async () => {
-      searchCalls++;
-      backoffUntil = h.at() + 30000; // как будто ЕМИАС ответил 429 на первой цели
+    search: async (t) => {
+      searched.push(t.id);
+      if (t.id === target.id) backoffUntil = h.at() + 30000;
       return { candidates: [], rejected: [], notes: [], action: null };
     },
     backoffUntil: () => backoffUntil,
@@ -666,10 +666,36 @@ test('C2: если пауза (backoffUntil) наступила после пе�
   await h.runner.start();
   // Холостой прогон тоже вызывал search() и уже успел взвести backoffUntil —
   // интересует только реальный тик, поэтому сбрасываем оба счётчика перед ним.
-  searchCalls = 0;
+  searched.length = 0;
   backoffUntil = 0;
   await h.runner.tick();
-  assert.equal(searchCalls, 1, 'после наступления паузы на первой цели вторая цель проверяться не должна была');
+  assert.deepEqual(searched, [target.id]);
+  h.advance(29999);
+  await h.runner.tick();
+  assert.deepEqual(searched, [target.id]);
+  h.advance(1);
+  await h.runner.tick();
+  assert.deepEqual(searched, [target.id, target2.id, target.id]);
+});
+
+test('общий лимит делится между целями, следующий цикл начинает отложенная цель', async () => {
+  const searched = [];
+  const h = harness({
+    search: async (t, { budget }) => {
+      searched.push([t.id, budget.remaining]);
+      budget.remaining -= Math.min(6, budget.remaining);
+      return { candidates: [], rejected: [], notes: [] };
+    },
+  });
+  const target2 = { ...target, id: 'lab2', title: 'Кровь 2' };
+  h.runner.setTargets([target, target2]);
+  h.runner.confirmDryRun((await h.runner.dryRun()).id);
+  await h.runner.start();
+  searched.length = 0;
+  await h.runner.tick();
+  h.advance(30000);
+  await h.runner.tick();
+  assert.deepEqual(searched, [[target.id, 6], [target2.id, 6]]);
 });
 
 // --- C1: событие booked обязано нести обновлённые current/source/scenario

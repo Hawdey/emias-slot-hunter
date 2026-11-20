@@ -53,7 +53,9 @@ async function environment({ mode = 'auto', scenario = 'shiftLab', intercept = a
     if (url.includes('getAssignmentsReferralsInfo')) return reply({ payload: { arInfo: { assignments: [
       { active: true, appointmentAvailable: true, moId: 10000001, toBM: { id: 1, name: 'Кровь' } },
     ] } } });
-    if (url.includes('getAppointmentReceptionsByPatient')) return reply({ payload: { appointment: booked ? [booked] : [] } });
+    if (url.includes('getAppointmentReceptionsByPatient')) {
+      return booked ? reply({ payload: { appointment: [booked] } }) : { ok: true, status: 204, text: async () => '' };
+    }
     if (url.includes('getDoctorsInfoForLI')) return reply(doctors);
     if (url.includes('getAvailableResourceScheduleInfo')) return reply(schedule);
     if (url.includes('createAppointment') || url.includes('shiftAppointment')) {
@@ -106,6 +108,27 @@ test('сквозной перенос: работающий поиск повт�
   assert.equal(writes.length, 2);
   assert.equal(writes[1].body.referralId, 555);
   assert.ok(env.events.some((event) => event.type === 'booked'));
+});
+
+test('сквозной перенос: отказ ЕМИАС с первой допустимой датой не вызывает повторной записи', async () => {
+  const env = await environment({ intercept: async (url) => {
+    if (url.includes('shiftAppointment')) {
+      return reply({ error: {
+        code: 'SA_REFERRAL_FOR_FUTURE', description: 'Запись по этому направлению будет доступна с 2026-09-27',
+      } }, 400);
+    }
+  } });
+  await env.core.start();
+  try {
+    await env.timer.queue.shift()();
+    assert.equal(env.core.status().targets[0].state, 'stopped');
+    assert.equal(env.calls.filter((call) => call.url.includes('shiftAppointment')).length, 1);
+    await env.timer.queue.shift()();
+    assert.equal(env.calls.filter((call) => call.url.includes('shiftAppointment')).length, 1);
+    assert.ok(!env.events.some((event) => event.type === 'booked'));
+  } finally {
+    env.core.stop();
+  }
 });
 
 for (const stopDuring of ['response', 'refresh']) {
@@ -189,13 +212,15 @@ class Element {
   addEventListener(type, handler) { this.listeners[type] = handler; }
   click() { return this.listeners.click({ isTrusted: true, currentTarget: this }); }
   querySelectorAll(selector) {
-    const matches = (node) => selector.startsWith('.') ? node.className.split(' ').includes(selector.slice(1)) : node.tagName === selector;
+    const [tag, className] = selector.split('.');
+    const matches = (node) => selector === '[data-role="step2-next"]' ? node.dataset.role === 'step2-next'
+      : (!tag || node.tagName === tag) && (!className || node.className.split(' ').includes(className));
     return this.children.flatMap((child) => [...(matches(child) ? [child] : []), ...child.querySelectorAll(selector)]);
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 }
 
-async function mountUi(env) {
+async function mountUi(env, { start = true } = {}) {
   const body = new Element('body');
   const timers = new Map();
   let nextTimer = 0;
@@ -223,11 +248,14 @@ async function mountUi(env) {
   const flush = () => new Promise(setImmediate);
   const check = () => root.querySelectorAll('input').find((node) => node.type === 'checkbox')
     .listeners.change({ target: { checked: true } });
-  async function startFromWizard() {
+  async function openConditions() {
     await button('Настроить').click();
     await flush();
     check();
     await button('Далее').click();
+  }
+  async function startFromWizard() {
+    await openConditions();
     await button('Далее').click();
     await flush();
     check();
@@ -235,9 +263,90 @@ async function mountUi(env) {
     await button('Понятно').click();
     assert.equal(core.status().running, true);
   }
-  await startFromWizard();
-  return { core, root, button, timers, startFromWizard };
+  if (start) await startFromWizard();
+  return { core, root, button, timers, startFromWizard, openConditions };
 }
+
+test('мастер новой записи проверяет одну дату, часы и два из четырёх адресов', async () => {
+  const addresses = [2, 3, 4, 5].map((house) => 'улица Тестовая, д. ' + house);
+  const times = ['08:30', '09:00', '09:05', '09:30'];
+  const resources = structuredClone(doctors);
+  resources.payload.doctorsInfo[0].availableResources[0].complexResource = addresses.map((address, index) => ({
+    id: 300000001 + index, room: { defaultAddress: address },
+  }));
+  const env = await environment({ scenario: 'bookLab', intercept: async (url, body) => {
+    if (url.endsWith('getDoctorsInfoForLI')) {
+      const period = body.assignment.period;
+      if (period.dateFrom === period.dateTo) {
+        return reply({ error: {
+          code: 'SA_REFERRAL_FOR_FUTURE', description: 'Запись по этому направлению будет доступна с 2026-09-24',
+        } }, 400);
+      }
+      return reply(resources);
+    }
+    if (url.endsWith('getAvailableResourceScheduleInfo')) {
+      const response = structuredClone(schedule);
+      const index = body.complexResourceId - 300000001;
+      const room = response.payload.availableResource.complexResource[0];
+      room.id = body.complexResourceId;
+      room.room.defaultAddress = addresses[index];
+      const block = response.payload.scheduleOfDay[0].scheduleBySlot[0];
+      block.complexResourceId = room.id;
+      block.slot = [{
+        startTime: '2026-09-24T' + times[index] + ':00+03:00',
+        endTime: '2026-09-24T09:50:00+03:00',
+      }];
+      return reply(response);
+    }
+  } });
+  const wizard = await mountUi(env, { start: false });
+  await wizard.openConditions();
+  const field = (label) => wizard.root.querySelectorAll('select').find((node) => node['aria-label'] === label);
+  const choose = (label, value) => field(label).listeners.change({ target: { value } });
+  const setField = (type, value, index = 0) => wizard.root.querySelectorAll('input').filter((input) => input.type === type)[index]
+    .listeners.change({ target: { value } });
+  assert.match(wizard.root.textContent, /Дата и время.*Время с \(МСК\)/);
+  assert.doesNotMatch(wizard.root.textContent, /Адрес текущей записи/);
+  assert.match(wizard.root.textContent, /Пересекающиеся приёмы пропускаются всегда/);
+  choose('Дни поиска', 'onlyDay');
+  assert.equal(wizard.button('Далее').disabled, true);
+  setField('date', '2026-09-24');
+  setField('time', '08:00');
+  setField('time', '10:00', 1);
+  choose('Где искать', 'choose');
+  await wizard.button('Загрузить адреса из ЕМИАС').click();
+  assert.deepEqual(env.calls.filter((call) => call.url.endsWith('getDoctorsInfoForLI')).at(-1).body.assignment.period,
+    { dateFrom: '2026-09-23', dateTo: '2026-10-23' });
+  const addressBox = wizard.root.querySelector('.esh-addresses');
+  const checkboxes = addressBox.querySelectorAll('input');
+  assert.deepEqual(checkboxes.map((input) => input.value), addresses);
+  assert.equal(wizard.button('Далее').disabled, true);
+  const toggle = (index, checked) => checkboxes[index].listeners.change({ target: { checked } });
+  toggle(1, true);
+  toggle(1, false);
+  assert.equal(wizard.button('Далее').disabled, true);
+  toggle(1, true);
+  toggle(3, true);
+  assert.equal(wizard.button('Далее').disabled, false);
+  const callCount = env.calls.length;
+  await wizard.button('Далее').click();
+  await new Promise(setImmediate);
+  assert.match(wizard.root.textContent, /любой из выбранных адресов — улица Тестовая, д\. 3 · улица Тестовая, д\. 5/);
+  assert.match(wizard.root.textContent, /время с 08:00 до 10:00/);
+  assert.match(wizard.root.textContent, /взяла бы 24 сентября, 09:00/);
+  assert.deepEqual(env.calls.slice(callCount)
+    .filter((call) => call.url.endsWith('getAvailableResourceScheduleInfo'))
+    .map((call) => call.body.complexResourceId), [300000002, 300000004]);
+  assert.ok(env.calls.every((call) => !/createAppointment|shiftAppointment/.test(call.url)));
+});
+
+test('мастер переноса предлагает адрес текущей записи и показывает его', async () => {
+  const env = await environment();
+  const wizard = await mountUi(env, { start: false });
+  await wizard.openConditions();
+  assert.match(wizard.root.textContent, /Адрес текущей записи/);
+  assert.match(wizard.root.textContent, /Подойдут корпуса по адресу улица Тестовая, д\. 2/);
+});
 
 for (const outcome of ['cancelled', 'refused', 'booked', 'restarted']) {
   test(`интерфейс → API → интерфейс: подтверждение и ${outcome}`, async () => {

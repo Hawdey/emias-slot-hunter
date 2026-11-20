@@ -1,9 +1,9 @@
 {
   "name": "emias-slot-hunter",
-  "version": "0.1.7",
+  "version": "0.2.3",
   "private": false,
   "license": "MIT",
-  "description": "Форк охотника за слотами ЕМИАС с фильтром «Только тот же врач» и проверкой перед записью",
+  "description": "Браузерный скрипт для поиска слотов в ЕМИАС. Поддерживает выбор нескольких адресов, перенос к тому же врачу, проверку перед записью и ограничение частоты запросов.",
   "scripts": {
     "test": "node scripts/check-fixtures.js && node --test test/*.test.js",
     "build": "node scripts/build.js"

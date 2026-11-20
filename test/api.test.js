@@ -100,14 +100,46 @@ test('I4: SessionError несёт понятный человеку текст, 
   });
 });
 
-test('429 ставит паузу на 30 секунд', async () => {
+test('429 без Retry-After ставит паузу на минуту', async () => {
   const api = createApi({
     session: fakeSession(), errors, now: () => 1000,
     fetch: async () => ({ ok: false, status: 429, text: async () => '' }),
   });
   const r = await api.post('v1/x', {});
   assert.equal(r.ok, false);
-  assert.equal(api.backoffUntil(), 31000);
+  assert.equal(api.backoffUntil(), 61000);
+});
+
+for (const retryAfter of ['120', new Date(121000).toUTCString()]) {
+  test(`пауза ЕМИАС учитывает Retry-After (${retryAfter})`, async () => {
+    let time = 1000;
+    let sent = 0;
+    const fetch = createTimedFetch(async () => {
+      sent++;
+      const status = sent === 1 ? 429 : 200;
+      return { ok: status === 200, status, text: async () => '', headers: new Headers({ 'Retry-After': retryAfter }) };
+    });
+    const api = createApi({ session: fakeSession(), errors, now: () => time, fetch });
+    assert.match((await api.post('v1/x', {})).explained.message, /120 сек/);
+    assert.equal(api.backoffUntil(), 121000);
+    time = 120999;
+    await api.post('v1/y', {});
+    assert.equal(sent, 1);
+    time = 121000;
+    assert.equal((await api.post('v1/y', {})).ok, true);
+    assert.equal(sent, 2);
+  });
+}
+
+test('браузерная очередь выдерживает две секунды даже при одновременных запросах', async () => {
+  let time = 0;
+  const times = [];
+  const api = createApi({
+    session: fakeSession(), errors, now: () => time, wait: async (delay) => { time += delay; },
+    fetch: async () => { times.push(time); return { ok: true, status: 200, text: async () => '' }; },
+  });
+  await Promise.all([api.post('v1/a', {}), api.post('v1/b', {}), api.post('v1/c', {})]);
+  assert.deepEqual(times, [0, 2000, 4000]);
 });
 
 test('сетевая ошибка увеличивает паузу и не роняет вызов', async () => {

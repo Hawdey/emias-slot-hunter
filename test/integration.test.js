@@ -84,6 +84,95 @@ test('полный путь: нашли цель → холостой прого
   assert.equal(h.status().targets[0].state, 'done');
 });
 
+test('постоянный 503 в первом кабинете не мешает записаться в следующий после паузы', async () => {
+  const resources = structuredClone(doctorsLi);
+  const firstRoom = 300000009;
+  const secondRoom = 300000001;
+  resources.payload.doctorsInfo[0].availableResources[0].complexResource.unshift({ id: firstRoom });
+  const e = env({ resources });
+  let time = Date.parse('2026-09-23T06:00:00Z');
+  let failFirstRoom = false;
+  const probes = [];
+  const h = create({
+    storage: e.storage, now: () => time, timer: e.timer, modules,
+    fetch: async (url, options) => {
+      if (url.endsWith('getAvailableResourceScheduleInfo')) {
+        const room = JSON.parse(options.body).complexResourceId;
+        probes.push(room);
+        if (failFirstRoom && room === firstRoom) return { ok: false, status: 503, text: async () => '' };
+      }
+      return e.fetchFn(url, options);
+    },
+  });
+  await h.init({ identity: { oms: OMS, birth: '2000-01-01' } });
+  const lab = (await h.discover()).find((o) => o.scenario === 'bookLab');
+  h.setTargets([{ ...lab, mode: 'auto', minLeadMs: 7200000 }]);
+  h.confirmDryRun((await h.dryRun()).id);
+  await h.start();
+  try {
+    failFirstRoom = true;
+    probes.length = 0;
+    await e.timer.queue.shift()();
+    assert.deepEqual(probes, [firstRoom]);
+    assert.equal(e.booked(), null);
+    time += 29999;
+    await e.timer.queue.shift()();
+    assert.deepEqual(probes, [firstRoom]);
+    time += 1;
+    await e.timer.queue.shift()();
+    assert.deepEqual(probes, [firstRoom, secondRoom]);
+    assert.equal(e.bookingRequest().complexResourceId, secondRoom);
+    assert.equal(h.status().targets[0].state, 'done');
+  } finally {
+    h.stop();
+  }
+});
+
+test('лимит распределяет запросы по циклам, а каталог из кеша не мешает обновлять слоты', async () => {
+  const resources = structuredClone(doctorsLi);
+  const rooms = resources.payload.doctorsInfo[0].availableResources[0].complexResource;
+  const e = env({ resources, scheduleFor({ complexResourceId }) {
+    const response = structuredClone(schedule);
+    response.payload.availableResource.complexResource[0].id = complexResourceId;
+    response.payload.scheduleOfDay[0].scheduleBySlot[0].complexResourceId = complexResourceId;
+    return response;
+  } });
+  let time = Date.parse('2026-09-23T06:00:00Z');
+  const probes = [];
+  const h = create({
+    storage: e.storage, now: () => time, timer: e.timer, modules,
+    fetch: async (url, options) => {
+      if (url.endsWith('getDoctorsInfoForLI')) probes.push('catalog');
+      if (url.endsWith('getAvailableResourceScheduleInfo')) probes.push(JSON.parse(options.body).complexResourceId);
+      return e.fetchFn(url, options);
+    },
+  });
+  await h.init({ identity: { oms: OMS, birth: '2000-01-01' } });
+  const lab = (await h.discover()).find((o) => o.scenario === 'bookLab');
+  h.setTargets([{ ...lab, mode: 'confirm', timeTo: '08:00' }]);
+  h.confirmDryRun((await h.dryRun()).id);
+  const furtherRooms = Array.from({ length: 7 }, (_, i) => ({ id: 300000002 + i }));
+  rooms.push(...furtherRooms);
+  const ids = rooms.map((room) => room.id);
+  await h.start();
+  try {
+    probes.length = 0;
+    await e.timer.queue.shift()();
+    assert.deepEqual(probes, ['catalog', ...ids.slice(0, 5)]);
+    probes.length = 0;
+    time += 30000;
+    await e.timer.queue.shift()();
+    assert.deepEqual(probes, ids.slice(5));
+    probes.length = 0;
+    time += 90000;
+    await e.timer.queue.shift()();
+    assert.deepEqual(probes, ['catalog', ...ids.slice(0, 5)]);
+    assert.equal(e.booked(), null);
+  } finally {
+    h.stop();
+  }
+});
+
 async function runLab(e, fetch, mode = 'auto') {
   const now = () => Date.parse('2026-09-23T06:00:00Z');
   const h = create({ storage: e.storage, fetch, now, timer: e.timer, modules });
@@ -94,6 +183,114 @@ async function runLab(e, fetch, mode = 'auto') {
   await h.start();
   return h;
 }
+
+for (const onlyDay of [null, '2026-09-24']) {
+  test(`расписание следующего дня проверяется сегодня с фильтром времени (выбранный день: ${!!onlyDay})`, async () => {
+    const day = '2026-09-24';
+    const calendarPeriod = { dateFrom: '2026-09-23', dateTo: '2026-10-23' };
+    const expectedPeriod = onlyDay ? calendarPeriod : { ...calendarPeriod, dateFrom: day };
+    let evening = Date.parse('2026-09-23T20:55:00Z');
+    let morningAvailable = false;
+    const resourcePeriods = [];
+    const e = env({ scheduleFor(body) {
+      assert.deepEqual(body.period, expectedPeriod);
+      const response = structuredClone(schedule);
+      response.payload.scheduleOfDay[0].scheduleBySlot[0].slot = [
+        { startTime: day + 'T13:00:00+03:00', endTime: day + 'T13:15:00+03:00' },
+      ];
+      const anotherDay = structuredClone(response.payload.scheduleOfDay[0]);
+      anotherDay.date = '2026-09-25';
+      anotherDay.scheduleBySlot[0].slot = [
+        { startTime: '2026-09-25T08:30:00+03:00', endTime: '2026-09-25T08:45:00+03:00' },
+      ];
+      response.payload.scheduleOfDay.push(anotherDay);
+      if (morningAvailable) {
+        response.payload.scheduleOfDay[0].scheduleBySlot[0].slot.push(
+          { startTime: day + 'T08:30:00+03:00', endTime: day + 'T08:45:00+03:00' });
+      }
+      return response;
+    } });
+    const h = create({
+      storage: e.storage, now: () => evening, timer: e.timer, modules,
+      fetch: async (url, options) => {
+        if (url.endsWith('getDoctorsInfoForLI')) {
+          const requested = JSON.parse(options.body).assignment.period;
+          resourcePeriods.push(requested);
+          if (requested.dateFrom === requested.dateTo || (!onlyDay && requested.dateFrom < day)) {
+            const json = { error: {
+              code: 'SA_REFERRAL_FOR_FUTURE',
+              description: 'Запись по этому направлению будет доступна с 2026-09-24',
+            } };
+            return { ok: false, status: 400, text: async () => JSON.stringify(json) };
+          }
+        }
+        return e.fetchFn(url, options);
+      },
+    });
+    await h.init({ identity: { oms: OMS, birth: '2000-01-01' } });
+    const lab = (await h.discover()).find((o) => o.scenario === 'bookLab');
+    h.setTargets([{ ...lab, onlyDay, dateTo: day, timeFrom: '08:00', timeTo: '10:00', mode: 'confirm', minLeadMs: 7200000 }]);
+    const report = await h.dryRun();
+    assert.equal(report.items[0].would, null);
+    assert.match(report.items[0].warnings.join(' '), /позже выбранного времени/);
+    assert.deepEqual(resourcePeriods, onlyDay ? [calendarPeriod] : [calendarPeriod, expectedPeriod]);
+    const logs = [];
+    h.on('log', ({ msg }) => logs.push(msg));
+    h.confirmDryRun(report.id);
+    await h.start();
+    try {
+      resourcePeriods.length = 0;
+      await e.timer.queue.shift()();
+      assert.deepEqual(resourcePeriods, [expectedPeriod]);
+      assert.deepEqual(h.status().pending, []);
+      assert.match(logs.join(' '), /Расписание получено, подходящих по условиям слотов нет/);
+      morningAvailable = true;
+      evening += 30000;
+      let offer;
+      h.on('needConfirm', (data) => { offer = data; });
+      await e.timer.queue.shift()();
+      assert.equal(offer.slot.startTime, day + 'T08:30:00+03:00');
+      assert.deepEqual(resourcePeriods, [expectedPeriod], 'каталог переиспользуется, расписание запрашивается снова');
+      assert.equal(e.booked(), null);
+    } finally {
+      h.stop();
+    }
+  });
+}
+
+test('без даты открытия останавливается только затронутая цель', async () => {
+  const e = env();
+  let affectedRequests = 0;
+  const h = create({
+    storage: e.storage, now: () => Date.parse('2026-09-23T06:00:00Z'), timer: e.timer, modules,
+    fetch: async (url, options) => {
+      if (url.endsWith('getDoctorsInfoForLI') && JSON.parse(options.body).assignment.moId === 10000001) {
+        affectedRequests++;
+        return { ok: false, status: 400, text: async () => JSON.stringify({ error: { code: 'SA_REFERRAL_FOR_FUTURE' } }) };
+      }
+      return e.fetchFn(url, options);
+    },
+  });
+  await h.init({ identity: { oms: OMS, birth: '2000-01-01' } });
+  const lab = (await h.discover()).find((o) => o.scenario === 'bookLab');
+  h.setTargets([
+    { ...lab, mode: 'confirm' },
+    { ...lab, id: 'lab:second', source: { ...lab.source, moId: 10000002 }, mode: 'confirm' },
+  ]);
+  h.confirmDryRun((await h.dryRun()).id);
+  await h.start();
+  try {
+    await e.timer.queue.shift()();
+    assert.equal(h.status().targets[0].state, 'stopped');
+    assert.deepEqual(h.status().pending, ['lab:second']);
+    const countAfterStop = affectedRequests;
+    await e.timer.queue.shift()();
+    assert.equal(affectedRequests, countAfterStop);
+    assert.equal(e.booked(), null);
+  } finally {
+    h.stop();
+  }
+});
 
 test('остановка во время запроса расписания не допускает отправки записи', async () => {
   const e = env();
